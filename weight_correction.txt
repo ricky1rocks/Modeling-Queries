@@ -1,0 +1,2164 @@
+select count(*) from weights1 where courier = 'DELHIVERY' AND dead_wt <25  order by 1 desc limit 10000;
+SELECT COUNT(*) FROM analytics_logistics.delhivery_billed_data;
+
+
+select distinct date,marketing_channel,sum(visits) visits,sum(orders) as 'orders'
+from snapdeal_reporting.platform_channel_all_data_cxo
+where date between current_date - 15 and current_date - 1
+group by 1,2;
+
+drop table if exists weights1;
+create local temp table weights1 on commit preserve rows as
+(
+select distinct
+awb_number,
+MAX(dead_wt) as 'dead_wt',
+max(vol_wt) as 'vol_wt',
+max(real_vol_wt) as 'real_vol_wt',
+max(chargeable_wt) as 'chargeable_wt',
+'DELHIVERY' as 'courier'
+
+from analytics_logistics.delhivery_billed_data
+where vol_wt>25
+AND dead_wt >25
+group by 1
+UNION
+select distinct
+awb_number,
+MAX(dead_wt*1000) as 'dead_wt' ,
+MAX(vol_wt*1000) as 'vol_wt',
+MAX(real_vol_wt*1000) as 'real_vol_wt',
+MAX(chargeable_wt*1000) as 'chargeable_wt',
+'ECOMM_EXP' as 'courier'
+
+from analytics_logistics.ecom_billed_data
+where vol_wt>25
+AND dead_wt >25
+
+group by 1
+);
+
+
+drop table if exists weights;
+create local temp table weights on commit preserve rows as
+(
+
+select distinct
+awb_number,
+dead_wt,
+vol_wt,
+case when real_vol_wt <25 then vol_wt else real_vol_wt end as 'real_vol_wt' ,
+chargeable_wt,
+courier
+
+from weights1
+);
+
+
+drop table if exists ay;
+create local temp table ay on commit preserve rows as
+(
+select
+dp.supc,
+count(distinct fsp.sp_tracking_number) as 'awbs'
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+join billing_dm.bills_fwd bf on bf.AWB = fsp.sp_tracking_number
+join weights w on w.awb_number = fsp.sp_tracking_number
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+where cg.courier_group IN ('DELHIVERY','ECOMM_EXP')
+group by 1
+)
+;
+
+
+
+drop table if exists mode_weight;
+create local temp table mode_weight on commit preserve rows as
+(
+select
+b.*
+from
+(
+select
+a.*,
+row_number() over(partition by supc order by charged_slab asc) as 'ranking'
+--row_number() over(partition by supc order by awbs desc, charged_slab asc) as 'ranking'
+
+from
+(select
+dp.supc,
+CEILING(greatest(dead_wt,real_vol_wt)/500) as 'charged_slab',
+count(distinct fsp.sp_tracking_number) as 'awbs',
+ROUND(count(distinct fsp.sp_tracking_number)*100/MAX(awbs),2.0)::float as 'order_perc',
+max(awbs) as 'Total_AWbs'
+
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join ay a on a.supc = dp.supc
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+join billing_dm.bills_fwd bf on bf.AWB = fsp.sp_tracking_number
+join weights w on w.awb_number = fsp.sp_tracking_number
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+
+--where to_date(fso.subo_date_created::varchar,'YYYYMMDD') between '2021-01-01' and '2021-05-31'
+where cg.courier_group IN ('DELHIVERY','ECOMM_EXP')
+group by 1,2
+having(count(distinct fsp.sp_tracking_number))>3 and ROUND(count(distinct fsp.sp_tracking_number)*100/MAX(awbs),2.0) >10
+)a
+)b
+where ranking = 1
+)
+;
+
+drop table if exists charged_weight;
+create local temp table charged_weight on commit preserve rows as
+(
+
+select distinct
+mw.supc,
+mw.charged_slab as 'charged_slab',
+--min(greatest(dead_wt,real_vol_wt)) as 'Min_vol_wgt',
+max(greatest(dead_wt,real_vol_wt)) as 'Max_vol_wgt',
+max(dead_wt) as 'Max_dead_wt'
+
+from mode_weight mw
+join dwh.d_product dp on dp.supc = mw.supc
+join dwh.f_suborders_oms fso on fso.product_sid = dp.product_Sid
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+join weights w on w.awb_number = fsp.sp_tracking_number 
+where CEILING(greatest(dead_wt,real_vol_wt)/500) = mw.charged_slab
+group by 1,2
+)
+;
+
+
+
+drop table if exists supc_weight;
+create local temp table supc_weight on commit preserve rows as
+(
+
+select 
+dp.supc,
+min(CEILING(greatest(dead_wt,real_vol_wt)/500)) as 'min_Slab',
+min(CEILING(greatest(dead_wt,real_vol_wt))) as 'min_weight',
+min(dead_wt) as 'Min_dead_wt',
+--max(CEILING(greatest(dead_wt,real_vol_wt)/500)) as 'max_slab',
+CEILING(avg(CEILING(greatest(dead_wt,real_vol_wt)/500))) as 'avg_slab',
+--CEILING(APPROXIMATE_MEDIAN(CEILING(greatest(dead_wt,real_vol_wt)/500))) as 'median_slab',
+max(mw.charged_slab) as 'Mode_Slab',
+--max(Min_vol_wgt) as 'Mode_min_vol_wgt',
+max(c.Max_vol_wgt) as 'Mode_max_vol_wgt',
+max(c.Max_dead_wt) as 'Max_dead_wt'
+
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+left join mode_weight mw on mw.supc = dp.supc
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+join weights w on w.awb_number = fsp.sp_tracking_number
+--left join billing_dm.bills_fwd bf on bf.AWB = fsp.sp_tracking_number
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join charged_weight c on c.supc = dp.supc
+--where to_date(fso.subo_date_created::varchar,'YYYYMMDD') between '2021-01-01' and '2021-05-31'
+where cg.courier_group IN ('DELHIVERY','ECOMM_EXP')
+group by 1
+)
+;
+
+drop table if exists soid;
+CREATE LOCAL TEMP TABLE soid ON COMMIT PRESERVE ROWS AS 
+(select
+fso.soi_id
+, MAX(CASE WHEN soid.attribute_name IN ('LENGTH') then soid.value::float else null end) as 'LENGTH'
+, MAX(CASE WHEN soid.attribute_name IN ('BREADTH') then soid.value::float else null end) as 'BREADTH'
+, MAX(CASE WHEN soid.attribute_name IN ('HEIGHT') then soid.value::float else null end) as 'HEIGHT'
+FROM dwh.f_suborders_oms fso
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id 
+join shipping_dwh.soi_detail soid on soid.soi_id = fso.soi_id and soid.attribute_name IN ('LENGTH','BREADTH','HEIGHT')
+where to_date(fso.subo_date_created::varchar,'YYYYMMDD') >='2021-01-01'
+group by 1
+);
+
+
+
+drop table if exists system_slab;
+create local temp table system_Slab on commit preserve rows as
+(
+select distinct 
+fso.suborder_code,
+dp.supc,
+CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float))/5)/500) as 'system_slab',
+CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float))/5)) as 'system_Weight',
+
+CEILING(greatest(dp.pa_weight::float,(dp.pa_length::float*dp.pa_breadth::float*dp.pa_height::float)/5)/500) as 'current_slab',
+CEILING(greatest(dp.pa_weight::float,(dp.pa_length::float*dp.pa_breadth::float*dp.pa_height::float)/5)) as 'current_wgt'
+
+--CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float)/5))) as 'current_Weight'
+
+
+
+from dwh.f_suborders_oms_vw fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join soid on soid.soi_id = fso.soi_id
+left join dwh.d_product_vendor dpv on dpv.vendor_sid = fso.vendor_sid
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id 
+
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1
+);
+
+
+drop table if exists packman;
+create local temp table packman on commit preserve rows as
+(
+select 
+dp.*,
+CEILING(greatest(dp.Weight::float,(dp.LENGTH::float*dp.BREADTH::float*dp.HEIGHT::float)/5)/500) as 'Packman_slab',
+CEILING(greatest(dp.Weight::float,(dp.LENGTH::float*dp.BREADTH::float*dp.HEIGHT::float)/5)) as 'Packman_wgt',
+dp.Weight::float as 'Packman_dead_wgt'
+
+
+from
+(
+select
+soi.suborder_Code,lower(soi.supc) as 'supc',sp.tracking_number,
+max(case when attribute_name = 'LENGTH' then value end) as "LENGTH",
+max(case when attribute_name = 'HEIGHT' then value end ) as "HEIGHT",
+max(case when attribute_name = 'BREADTH' then value end ) as "BREADTH",
+max(shp.manifest_weight) as 'Weight'
+from shipping_dwh.seller_package sp
+JOIN shipping_dwh.seller_item si on si.seller_package_id = sp.id
+join shipping_dwh.shipping_order_item soi on soi.suborder_Code = si.suborder_code
+join shipping_dwh.seller_package_detail spd on spd.seller_package_id = sp.id
+join shipping_dwh.shipping_package shp on shp.reference_code = sp.code
+join dwh.f_suborders_oms fso on fso.suborder_code = soi.suborder_code
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id 
+
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1
+--where date(soi.created) >= '2021-01-01'
+group by 1,2,3
+)dp
+)
+;
+
+
+drop table if exists packman_weight1;
+create local temp table packman_weight1 on commit preserve rows as
+(
+
+select 
+supc,
+--min(Packman_wgt) as 'Packman_vol_wgt',
+min(Packman_slab) as 'Packman_slab'
+--min()
+
+from packman
+group by 1
+)
+;
+
+
+
+
+drop table if exists packman_weight;
+create local temp table packman_weight on commit preserve rows as
+(
+
+select 
+p.supc,
+max(p.Packman_slab) as 'Packman_slab',
+max(p.Packman_wgt::float) as 'Packman_vol_wgt',
+max(p.Packman_dead_wgt::float) as 'Packman_dead_wgt'
+
+--min(Packman_wgt) as 'Packman_vol_wgt',
+--min(Packman_slab) as 'Packman_slab'
+--min()
+
+from packman p
+join packman_weight1 p1 on p1.supc = p.supc and p1.Packman_slab = p.Packman_slab
+group by 1
+)
+;
+
+
+
+
+
+
+drop table if exists final;
+create local temp table final on commit preserve rows as
+(
+select 
+s.supc,
+s.current_slab,
+s.current_wgt as 'Current_Vol_Wgt',
+
+case when sw.Mode_Slab is null then sw.min_Slab else sw.Mode_Slab end as 'Final_slab',
+case when sw.Mode_Slab is null then sw.min_weight else sw.Mode_max_vol_wgt end as 'Final_slab_Vol_wgt',
+case when sw.Mode_Slab is null then sw.Min_dead_wt else sw.Max_dead_wt end as 'Final_slab_Dead_wgt',
+pw.Packman_slab,
+pw.Packman_vol_wgt,
+pw.Packman_dead_wgt,
+
+count(distinct s.suborder_code) as 'Suborders_Booked',
+count(distinct case when fsp.sph_date_shipped is not null then s.suborder_Code end) as 'Shipped',
+count(distinct case when cg.courier_group= 'LAAP_SD' and fsp.sph_date_shipped is not null then s.suborder_Code end) as 'LAAP',
+count(distinct case when cg.courier_group IN ('DELHIVERY','ECOMM_EXP') and fsp.sph_date_shipped is not null then s.suborder_Code end) as 'delhivery_Ecom'
+--count(distinct case when cg.courier= 'ECO' and fsp.sph_date_shipped is not null then s.suborder_Code end) as 'LAAP',
+
+from system_slab s
+join dwh.f_suborders_oms fso on fso.suborder_code = s.suborder_code
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+left join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join supc_weight sw on sw.supc = dp.supc
+left join mode_weight mw on mw.supc = dp.supc
+left join packman_weight pw on pw.supc = dp.supc
+group by 1,2,3,4,5,6,7,8,9
+)
+;
+
+
+
+
+
+select distinct 
+f.*,least(Final_slab,packman_slab,current_slab) as 'Estimated_slab',
+least(Final_slab_Vol_wgt,Packman_vol_wgt) as 'Estimated_Volumetrics_wgt',
+least(Final_slab_Dead_wgt,Packman_dead_wgt) as 'Estimated_Dead_wgt',
+current_slab-least(Final_slab,packman_slab,current_slab) as 'opportunity_slab' 
+from final f
+where current_slab > least(Final_slab,packman_slab,current_slab)
+
+;
+
+select * from mode_Weight where supc = 'sdl631413398'
+
+select distinct
+w.*
+
+from weights1 w
+join dwh.f_shipping_package fsp on fsp.sp_tracking_number = w.awb_number
+left join dwh.f_suborders_oms fso on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+where dp.supc = 'sdl631413398'
+;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<output_supress_begin>
+drop table if exists soid;
+CREATE LOCAL TEMP TABLE soid ON COMMIT PRESERVE ROWS AS 
+(select
+fso.soi_id
+, MAX(CASE WHEN soid.attribute_name IN ('LENGTH') then soid.value::float else null end) as 'LENGTH'
+, MAX(CASE WHEN soid.attribute_name IN ('BREADTH') then soid.value::float else null end) as 'BREADTH'
+, MAX(CASE WHEN soid.attribute_name IN ('HEIGHT') then soid.value::float else null end) as 'HEIGHT'
+FROM dwh.f_suborders_oms fso
+left join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id 
+join shipping_dwh.soi_detail soid on soid.soi_id = fso.soi_id and soid.attribute_name IN ('LENGTH','BREADTH','HEIGHT')
+where to_date(fso.subo_date_created::varchar,'YYYYMMDD') >='2021-01-01'
+group by 1
+);
+
+
+
+drop table if exists system_slab;
+create local temp table system_Slab on commit preserve rows as
+(
+select distinct 
+fso.suborder_code,
+dp.supc,
+--CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float))/5)/500) as 'system_slab',
+--CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float))/5)) as 'system_Weight',
+
+--CEILING(greatest(dp.pa_weight::float,(dp.pa_length::float*dp.pa_breadth::float*dp.pa_height::float)/5)/500) as 'current_slab',
+--CEILING(greatest(dp.pa_weight::float,(dp.pa_length::float*dp.pa_breadth::float*dp.pa_height::float)/5)) as 'current_wgt'
+
+
+CEILING(greatest(fso.soi_weight::float,(soid.LENGTH::float*soid.BREADTH::float*soid.HEIGHT::float)/5)/500) as 'System_Slab',
+CEILING(greatest(fso.soi_weight::float,(soid.LENGTH::float*soid.BREADTH::float*soid.HEIGHT::float)/5)) as 'System_weight'
+
+--CEILING(greatest(dp.pa_weight::float,(dp.pa_length::float*dp.pa_breadth::float*dp.pa_height::float)/5)) as 'current_wgt'
+
+
+--CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float)/5))) as 'current_Weight'
+
+
+
+from dwh.f_suborders_oms_vw fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join soid on soid.soi_id = fso.soi_id
+join dwh.d_product_vendor dpv on dpv.vendor_sid = fso.vendor_sid
+where to_date(fso.subo_date_created::varchar,'YYYYMMDD') >= '2021-05-01' --'2021-07-01' and '2021-08-25'
+);
+
+
+
+
+
+drop table if exists snm;
+create local temp table snm on commit preserve rows as
+(
+select distinct
+lower(old_Context) as 'old_Context',
+lower(serviceableCourierCode) as 'serviceableCourierCode',
+lower(allocatedCourierCode) as 'allocatedCourierCode',
+nonfilteredffc,
+nonfilteredrtoPercentage,
+nonfilteredfwdCost,
+nonfilteredrtoCost,
+nonfilteredcodCost,
+nonfilteredbilledRatio,
+(nonfilteredffc-(nonfilteredcodCost*(1-(nonfilteredrtoPercentage)/100)))/(1-(nonfilteredrtoPercentage)/100)::float as 'delivered_cost'
+
+from analytics_logistics.sca_capacity_table
+)
+;
+ 
+drop table if exists snnm;
+create local temp table snnm on commit preserve rows as
+(
+select
+distinct
+soi.suborder_code,
+lower(sd.value) as 'value'
+FROM shipping_dwh.shipping_order_item soi
+join shipping_dwh.soi_detail sd on sd.soi_id = soi.id and sd.attribute_name='SOFT_ALLOCATION_CONTEXT'
+where date(soi.created) between current_date-250 and current_date-1
+)
+;
+ 
+drop table if exists sn1m;
+create local temp table sn1m on commit preserve rows as
+(
+select distinct
+a1.*,
+snn.suborder_code
+
+FROM snm a1
+join snnm snn on  a1.old_context=snn.value
+)
+;
+
+drop table if exists fwd_cost;
+create local temp table fwd_cost on commit preserve rows as
+(
+select 
+a.suborder_code,
+a.delivered_cost_new as 'delivered_cost',
+a.nonfilteredfwdCost as 'fwd_Cost',
+case when upper(serviceableCourierCode) IN ('XB_ESSENTIAL','XB_SECONDARY') and verified_date between '2021-06-15' and '2021-09-10' then delivered_cost_new
+     when upper(serviceableCourierCode) IN ('XB_ESSENTIAL','XB_SECONDARY') and verified_Date  = '2021-09-11' and nonfilteredfwdCost =0 then delivered_cost_new
+     when courier_group IN ('LAAP_SD') then delivered_cost_new
+else nonfilteredfwdCost end as 'nonfilteredfwdCost'
+
+from
+(select
+sn1m.*,
+cg.courier_group,
+to_date(fso.subo_date_verified::varchar,'YYYYMMDD') as 'verified_Date',
+--fso.suborder_code,
+--sn1m.nonfilteredfwdCost as 'fwd_cost',
+
+--sn1m.delivered_cost,
+case when nonfilteredrtoPercentage>= 100 and upper(serviceableCourierCode) IN('XB_ESSENTIAL','XB_SECONDARY') then 62
+     when nonfilteredrtoPercentage>= 100 and cg.courier_group IN ('LAAP_SD') then 56.09
+     else delivered_cost end as 'delivered_cost_new'
+
+
+
+/*case when upper(serviceableCourierCode) IN ('XB_ESSENTIAL','XB_SECONDARY') and to_date(fso.subo_date_verified::varchar,'YYYYMMDD') between '2021-06-15' and '2021-09-10' then delivered_cost
+     when upper(serviceableCourierCode) IN ('XB_ESSENTIAL','XB_SECONDARY') and to_date(fso.subo_date_verified::varchar,'YYYYMMDD') = '2021-09-11' and nonfilteredfwdCost =0 then delivered_cost
+     when cg.courier_group IN ('LAAP_SD') then delivered_cost
+else nonfilteredfwdCost end as 'nonfilteredfwdCost'
+*/
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+join sn1m on sn1m.suborder_code = fso.suborder_code
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+--join system_Slab s on s.suborder_code = fso.suborder_code and s.system_slab is not null
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+and lower(cg.code) = sn1m.serviceableCourierCode
+
+)a
+
+)
+;
+
+<output_supress_end>
+
+
+
+
+select 
+
+'Shipped Suborders' as 'Note'
+;
+
+
+
+select
+        1 as 'Sr.No',
+        'Total Shipped Suborders' as 'Metrics',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end) as 'D-1',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end) as 'D-2',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end)as 'D-3',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end)as 'D-4',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end)as 'D-5',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end)as 'D-6',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end)as 'D-7',
+        --count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-8 then fso.suborder_code end)as 'D-8',
+        
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end)/7,0.0)::float as 'W-1',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end)/7,0.0)::float as 'W-2',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end)/7,0.0)::float as 'W-3',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end)/7,0.0)::float as 'W-4',
+        
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end)/day(current_date-1),0.0)::float as 'MTD',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '2' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH))+1),0.0)::float as 'M-1',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '3' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH))+1),0.0)::float as 'M-2',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '4' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH))+1),0.0)::float as 'M-3'
+        
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+--join system_Slab s on s.suborder_code = fso.suborder_code
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+group by 1
+UNION
+select
+        2 as 'Sr.No',
+        'Changes done as per recommendation and going to API couriers' as 'Metrics',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end) as 'D-1',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end) as 'D-2',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end)as 'D-3',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end)as 'D-4',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end)as 'D-5',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end)as 'D-6',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end)as 'D-7',
+        --count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-8 then fso.suborder_code end)as 'D-8',
+        
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end)/7,0.0)::float as 'W-1',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end)/7,0.0)::float as 'W-2',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end)/7,0.0)::float as 'W-3',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end)/7,0.0)::float as 'W-4',
+        
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end)/day(current_date-1),0.0)::float as 'MTD',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '2' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH))+1),0.0)::float as 'M-1',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '3' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH))+1),0.0)::float as 'M-2',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '4' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH))+1),0.0)::float as 'M-3'
+        
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+--join system_Slab s on s.suborder_code = fso.suborder_code
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+and ws.supc is not null 
+and cg.courier_group NOT IN ('DELHIVERY','LAAP_SD','ECOMM_EXP')
+group by 1
+UNION
+
+select
+        3 as 'Sr.No',
+        'Changes done as per recommendation and going to Non API couriers' as 'Metrics',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end) as 'D-1',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end) as 'D-2',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end)as 'D-3',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end)as 'D-4',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end)as 'D-5',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end)as 'D-6',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end)as 'D-7',
+        --count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-8 then fso.suborder_code end)as 'D-8',
+        
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end)/7,0.0)::float as 'W-1',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end)/7,0.0)::float as 'W-2',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end)/7,0.0)::float as 'W-3',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end)/7,0.0)::float as 'W-4',
+        
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end)/day(current_date-1),0.0)::float as 'MTD',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '2' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH))+1),0.0)::float as 'M-1',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '3' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH))+1),0.0)::float as 'M-2',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '4' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH))+1),0.0)::float as 'M-3'
+        
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+--join system_Slab s on s.suborder_code = fso.suborder_code
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+and ws.supc is not null 
+and cg.courier_group IN ('DELHIVERY','LAAP_SD','ECOMM_EXP')
+group by 1
+UNION
+select
+        4 as 'Sr.No',
+        'SUPCs outside the one time corrected list' as 'Metrics',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end) as 'D-1',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end) as 'D-2',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end)as 'D-3',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end)as 'D-4',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end)as 'D-5',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end)as 'D-6',
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end)as 'D-7',
+        --count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-8 then fso.suborder_code end)as 'D-8',
+        
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end)/7,0.0)::float as 'W-1',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end)/7,0.0)::float as 'W-2',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end)/7,0.0)::float as 'W-3',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end)/7,0.0)::float as 'W-4',
+        
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end)/day(current_date-1),0.0)::float as 'MTD',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '2' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH))+1),0.0)::float as 'M-1',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '3' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH))+1),0.0)::float as 'M-2',
+        ROUND(count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD')  between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end)/(DATEDIFF('dd',date(last_day((getdate()-1)-interval '4' month) +interval '1' day),LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH))+1),0.0)::float as 'M-3'
+        
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+--join system_Slab s on s.suborder_code = fso.suborder_code
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+and ws.supc is null
+group by 1
+order by 1
+;
+
+
+
+
+
+select 
+
+'Avg. Slab' as 'Note'
+;
+
+
+
+
+
+
+select  distinct
+        1 as 'SR.No',
+        'Avg. Slab(Overall)' as 'Metrics',
+        --'Executable Orders' as 'Metrics',
+        --count(distinct fso.suborder_code) as 'Suborders'
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end),2.0)::float as 'D-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end),2.0)::float as 'D-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end),2.0)::float as 'D-3',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end),2.0)::float as 'D-4',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end),2.0)::float as 'D-5',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end),2.0)::float as 'D-6',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end),2.0)::float as 'D-7',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end),2.0)::float as 'W-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end),2.0)::float as 'W-2',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end),2.0)::float as 'W-3',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end),2.0)::float as 'W-4',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end),2.0)::float as 'MTD',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end),2.0)::float as 'M-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end),2.0)::float as 'M-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end),2.0)::float as 'M-3'
+        
+        
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+join system_Slab s on s.suborder_code = fso.suborder_code and s.system_slab is not null
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+UNION
+select  distinct
+        2 as 'SR.No',
+        'Avg. Slab(Changes done as per recommendation and going to API couriers)' as 'Metrics',
+        --'Executable Orders' as 'Metrics',
+        --count(distinct fso.suborder_code) as 'Suborders'
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end),2.0)::float as 'D-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end),2.0)::float as 'D-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end),2.0)::float as 'D-3',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end),2.0)::float as 'D-4',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end),2.0)::float as 'D-5',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end),2.0)::float as 'D-6',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end),2.0)::float as 'D-7',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end),2.0)::float as 'W-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end),2.0)::float as 'W-2',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end),2.0)::float as 'W-3',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end),2.0)::float as 'W-4',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end),2.0)::float as 'MTD',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end),2.0)::float as 'M-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end),2.0)::float as 'M-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end),2.0)::float as 'M-3'
+        
+        
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+join system_Slab s on s.suborder_code = fso.suborder_code and s.system_slab is not null
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+and ws.supc is not null 
+and cg.courier_group NOT IN ('DELHIVERY','LAAP_SD','ECOMM_EXP')
+UNION
+select  distinct
+        3 as 'SR.No',
+        'Avg. Slab(Changes done as per recommendation and going to NON API couriers)' as 'Metrics',
+        --'Executable Orders' as 'Metrics',
+        --count(distinct fso.suborder_code) as 'Suborders'
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end),2.0)::float as 'D-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end),2.0)::float as 'D-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end),2.0)::float as 'D-3',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end),2.0)::float as 'D-4',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end),2.0)::float as 'D-5',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end),2.0)::float as 'D-6',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end),2.0)::float as 'D-7',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end),2.0)::float as 'W-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end),2.0)::float as 'W-2',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end),2.0)::float as 'W-3',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end),2.0)::float as 'W-4',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end),2.0)::float as 'MTD',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end),2.0)::float as 'M-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end),2.0)::float as 'M-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end),2.0)::float as 'M-3'
+        
+        
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+join system_Slab s on s.suborder_code = fso.suborder_code and s.system_slab is not null
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+and ws.supc is not null 
+and cg.courier_group IN ('DELHIVERY','LAAP_SD','ECOMM_EXP')
+
+UNION
+select  distinct
+        4 as 'SR.No',
+        'SUPCs outside the one time corrected list' as 'Metrics',
+        --'Executable Orders' as 'Metrics',
+        --count(distinct fso.suborder_code) as 'Suborders'
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end),2.0)::float as 'D-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end),2.0)::float as 'D-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end),2.0)::float as 'D-3',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end),2.0)::float as 'D-4',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end),2.0)::float as 'D-5',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end),2.0)::float as 'D-6',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end),2.0)::float as 'D-7',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end),2.0)::float as 'W-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end),2.0)::float as 'W-2',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end),2.0)::float as 'W-3',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end),2.0)::float as 'W-4',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end),2.0)::float as 'MTD',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end),2.0)::float as 'M-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end),2.0)::float as 'M-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH)  then s.system_slab end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end),2.0)::float as 'M-3'
+        
+        
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+join system_Slab s on s.suborder_code = fso.suborder_code and s.system_slab is not null
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+and ws.supc is null 
+--and cg.courier_group IN ('DELHIVERY','LAAP_SD','ECOMM_EXP')
+order by 1
+;
+
+
+
+
+
+
+
+select 
+
+'Fwd cost' as 'Note'
+;
+
+
+
+
+
+
+select  distinct
+        1 as 'SR.No',
+        'Fwd cost(Overall)' as 'Metrics',
+        --'Executable Orders' as 'Metrics',
+        --count(distinct fso.suborder_code) as 'Suborders'
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end),2.0)::float as 'D-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end),2.0)::float as 'D-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end),2.0)::float as 'D-3',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end),2.0)::float as 'D-4',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end),2.0)::float as 'D-5',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end),2.0)::float as 'D-6',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end),2.0)::float as 'D-7',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end),2.0)::float as 'W-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end),2.0)::float as 'W-2',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end),2.0)::float as 'W-3',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end),2.0)::float as 'W-4',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end),2.0)::float as 'MTD',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end),2.0)::float as 'M-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end),2.0)::float as 'M-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end),2.0)::float as 'M-3'
+        
+        
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+join fwd_cost s on s.suborder_code = fso.suborder_code and nonfilteredfwdCost is not null
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+UNION
+select  distinct
+        2 as 'SR.No',
+        'Fwd cost(Changes done as per recommendation and going to API couriers)' as 'Metrics',
+        --'Executable Orders' as 'Metrics',
+        --count(distinct fso.suborder_code) as 'Suborders'
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end),2.0)::float as 'D-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end),2.0)::float as 'D-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end),2.0)::float as 'D-3',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end),2.0)::float as 'D-4',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end),2.0)::float as 'D-5',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end),2.0)::float as 'D-6',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end),2.0)::float as 'D-7',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end),2.0)::float as 'W-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end),2.0)::float as 'W-2',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end),2.0)::float as 'W-3',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end),2.0)::float as 'W-4',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end),2.0)::float as 'MTD',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end),2.0)::float as 'M-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end),2.0)::float as 'M-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end),2.0)::float as 'M-3'
+        
+        
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+join fwd_cost s on s.suborder_code = fso.suborder_code and nonfilteredfwdCost is not null
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+and ws.supc is not null 
+and cg.courier_group NOT IN ('DELHIVERY','LAAP_SD','ECOMM_EXP')
+UNION
+select  distinct
+        3 as 'SR.No',
+        'Fwd cost(Changes done as per recommendation and going to NON API couriers)' as 'Metrics',
+        --'Executable Orders' as 'Metrics',
+        --count(distinct fso.suborder_code) as 'Suborders'
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end),2.0)::float as 'D-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end),2.0)::float as 'D-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end),2.0)::float as 'D-3',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end),2.0)::float as 'D-4',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end),2.0)::float as 'D-5',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end),2.0)::float as 'D-6',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end),2.0)::float as 'D-7',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end),2.0)::float as 'W-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end),2.0)::float as 'W-2',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end),2.0)::float as 'W-3',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end),2.0)::float as 'W-4',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end),2.0)::float as 'MTD',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end),2.0)::float as 'M-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end),2.0)::float as 'M-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end),2.0)::float as 'M-3'
+        
+        
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+join fwd_cost s on s.suborder_code = fso.suborder_code and nonfilteredfwdCost is not null
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+and ws.supc is not null 
+and cg.courier_group IN ('DELHIVERY','LAAP_SD','ECOMM_EXP')
+
+UNION
+select  distinct
+        4 as 'SR.No',
+        'SUPCs outside the one time corrected list' as 'Metrics',
+        --'Executable Orders' as 'Metrics',
+        --count(distinct fso.suborder_code) as 'Suborders'
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-1 then fso.suborder_code end),2.0)::float as 'D-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-2 then fso.suborder_code end),2.0)::float as 'D-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-3 then fso.suborder_code end),2.0)::float as 'D-3',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-4 then fso.suborder_code end),2.0)::float as 'D-4',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-5 then fso.suborder_code end),2.0)::float as 'D-5',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-6 then fso.suborder_code end),2.0)::float as 'D-6',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') = current_date-7 then fso.suborder_code end),2.0)::float as 'D-7',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-7 and current_date-1 then fso.suborder_code end),2.0)::float as 'W-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-14 and current_date-8 then fso.suborder_code end),2.0)::float as 'W-2',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-21 and current_date-15 then fso.suborder_code end),2.0)::float as 'W-3',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-28 and current_date-22 then fso.suborder_code end),2.0)::float as 'W-4',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '1' month) +interval '1' day) and current_date-1 then fso.suborder_code end),2.0)::float as 'MTD',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '2' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '1' MONTH) then fso.suborder_code end),2.0)::float as 'M-1',
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '3' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '2' MONTH) then fso.suborder_code end),2.0)::float as 'M-2',
+        
+        
+        ROUND(sum( case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH)  then nonfilteredfwdCost end)/
+        count(distinct case when to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and LAST_DAY((CURRENT_DATE-1) - interval '3' MONTH) then fso.suborder_code end),2.0)::float as 'M-3'
+        
+        
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join analytics_logistics.weight_correction_supcs ws on lower(ws.supc) = lower(dp.supc)
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+--left join analytics_logistics.unit_economics_base_table ue on ue.suborder_code = fso.suborder_Code
+join fwd_cost s on s.suborder_code = fso.suborder_code and nonfilteredfwdCost is not null
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between date(last_day((getdate()-1)-interval '4' month) +interval '1' day) and current_date-1
+and ws.supc is null 
+--and cg.courier_group IN ('DELHIVERY','LAAP_SD','ECOMM_EXP')
+order by 1
+;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<output_supress_begin>
+drop table if exists weights1;
+create local temp table weights1 on commit preserve rows as
+(
+select distinct
+awb_number,
+MAX(dead_wt) as 'dead_wt',
+max(vol_wt) as 'vol_wt',
+max(real_vol_wt) as 'real_vol_wt',
+max(chargeable_wt) as 'chargeable_wt',
+'DELHIVERY' as 'courier'
+
+from analytics_logistics.delhivery_billed_data
+where vol_wt>25
+AND dead_wt >25
+group by 1
+UNION
+select distinct
+awb_number,
+MAX(dead_wt*1000) as 'dead_wt' ,
+MAX(vol_wt*1000) as 'vol_wt',
+MAX(real_vol_wt*1000) as 'real_vol_wt',
+MAX(chargeable_wt*1000) as 'chargeable_wt',
+'ECOMM_EXP' as 'courier'
+
+from analytics_logistics.ecom_billed_data
+where vol_wt>25
+AND dead_wt >25
+
+group by 1
+);
+
+
+drop table if exists weights;
+create local temp table weights on commit preserve rows as
+(
+
+select distinct
+awb_number,
+dead_wt,
+vol_wt,
+case when real_vol_wt <25 then vol_wt else real_vol_wt end as 'real_vol_wt' ,
+chargeable_wt,
+courier
+
+from weights1
+);
+
+
+drop table if exists ay;
+create local temp table ay on commit preserve rows as
+(
+select
+dp.supc,
+count(distinct fsp.sp_tracking_number) as 'awbs'
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+join billing_dm.bills_fwd bf on bf.AWB = fsp.sp_tracking_number
+join weights w on w.awb_number = fsp.sp_tracking_number
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+where cg.courier_group IN ('DELHIVERY','ECOMM_EXP')
+group by 1
+)
+;
+
+
+
+
+drop table if exists mode_weight;
+create local temp table mode_weight on commit preserve rows as
+(
+select
+b.*
+from
+(
+select
+a.*,
+row_number() over(partition by supc order by charged_slab asc) as 'ranking'
+--row_number() over(partition by supc order by awbs desc, charged_slab asc) as 'ranking'
+
+from
+(select
+dp.supc,
+CEILING(greatest(dead_wt,real_vol_wt)/500) as 'charged_slab',
+count(distinct fsp.sp_tracking_number) as 'awbs',
+ROUND(count(distinct fsp.sp_tracking_number)*100/MAX(awbs),2.0)::float as 'order_perc',
+max(awbs) as 'Total_AWbs'
+
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+join ay a on a.supc = dp.supc
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+join billing_dm.bills_fwd bf on bf.AWB = fsp.sp_tracking_number
+join weights w on w.awb_number = fsp.sp_tracking_number
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+
+--where to_date(fso.subo_date_created::varchar,'YYYYMMDD') between '2021-01-01' and '2021-05-31'
+where cg.courier_group IN ('DELHIVERY','ECOMM_EXP')
+group by 1,2
+having(count(distinct fsp.sp_tracking_number))>3 and ROUND(count(distinct fsp.sp_tracking_number)*100/MAX(awbs),2.0) >10
+)a
+)b
+where ranking = 1
+)
+;
+
+drop table if exists charged_weight;
+create local temp table charged_weight on commit preserve rows as
+(
+
+select distinct
+mw.supc,
+mw.charged_slab as 'charged_slab',
+--min(greatest(dead_wt,real_vol_wt)) as 'Min_vol_wgt',
+max(greatest(dead_wt,real_vol_wt)) as 'Max_vol_wgt',
+max(dead_wt) as 'Max_dead_wt'
+
+from mode_weight mw
+join dwh.d_product dp on dp.supc = mw.supc
+join dwh.f_suborders_oms fso on fso.product_sid = dp.product_Sid
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+join weights w on w.awb_number = fsp.sp_tracking_number 
+where CEILING(greatest(dead_wt,real_vol_wt)/500) = mw.charged_slab
+group by 1,2
+)
+;
+
+
+
+drop table if exists supc_weight;
+create local temp table supc_weight on commit preserve rows as
+(
+
+select 
+dp.supc,
+min(CEILING(greatest(dead_wt,real_vol_wt)/500)) as 'min_Slab',
+min(CEILING(greatest(dead_wt,real_vol_wt))) as 'min_weight',
+min(dead_wt) as 'Min_dead_wt',
+--max(CEILING(greatest(dead_wt,real_vol_wt)/500)) as 'max_slab',
+CEILING(avg(CEILING(greatest(dead_wt,real_vol_wt)/500))) as 'avg_slab',
+--CEILING(APPROXIMATE_MEDIAN(CEILING(greatest(dead_wt,real_vol_wt)/500))) as 'median_slab',
+max(mw.charged_slab) as 'Mode_Slab',
+--max(Min_vol_wgt) as 'Mode_min_vol_wgt',
+max(c.Max_vol_wgt) as 'Mode_max_vol_wgt',
+max(c.Max_dead_wt) as 'Max_dead_wt'
+
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+left join mode_weight mw on mw.supc = dp.supc
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+join weights w on w.awb_number = fsp.sp_tracking_number
+--left join billing_dm.bills_fwd bf on bf.AWB = fsp.sp_tracking_number
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join charged_weight c on c.supc = dp.supc
+--where to_date(fso.subo_date_created::varchar,'YYYYMMDD') between '2021-01-01' and '2021-05-31'
+where cg.courier_group IN ('DELHIVERY','ECOMM_EXP')
+group by 1
+)
+;
+
+drop table if exists soid;
+CREATE LOCAL TEMP TABLE soid ON COMMIT PRESERVE ROWS AS 
+(select
+fso.soi_id
+, MAX(CASE WHEN soid.attribute_name IN ('LENGTH') then soid.value::float else null end) as 'LENGTH'
+, MAX(CASE WHEN soid.attribute_name IN ('BREADTH') then soid.value::float else null end) as 'BREADTH'
+, MAX(CASE WHEN soid.attribute_name IN ('HEIGHT') then soid.value::float else null end) as 'HEIGHT'
+FROM dwh.f_suborders_oms fso
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id 
+join shipping_dwh.soi_detail soid on soid.soi_id = fso.soi_id and soid.attribute_name IN ('LENGTH','BREADTH','HEIGHT')
+where to_date(fso.subo_date_created::varchar,'YYYYMMDD') >='2021-01-01'
+group by 1
+);
+
+
+
+drop table if exists system_slab;
+create local temp table system_Slab on commit preserve rows as
+(
+select distinct 
+fso.suborder_code,
+dp.supc,
+CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float))/5)/500) as 'system_slab',
+CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float))/5)) as 'system_Weight',
+
+CEILING(greatest(dp.pa_weight::float,(dp.pa_length::float*dp.pa_breadth::float*dp.pa_height::float)/5)/500) as 'current_slab',
+CEILING(greatest(dp.pa_weight::float,(dp.pa_length::float*dp.pa_breadth::float*dp.pa_height::float)/5)) as 'current_wgt'
+
+--CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float)/5))) as 'current_Weight'
+
+
+
+from dwh.f_suborders_oms_vw fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join soid on soid.soi_id = fso.soi_id
+left join dwh.d_product_vendor dpv on dpv.vendor_sid = fso.vendor_sid
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id 
+
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-140 and current_date-1
+);
+
+
+drop table if exists packman;
+create local temp table packman on commit preserve rows as
+(
+select 
+dp.*,
+CEILING(greatest(dp.Weight::float,(dp.LENGTH::float*dp.BREADTH::float*dp.HEIGHT::float)/5)/500) as 'Packman_slab',
+CEILING(greatest(dp.Weight::float,(dp.LENGTH::float*dp.BREADTH::float*dp.HEIGHT::float)/5)) as 'Packman_wgt',
+dp.Weight::float as 'Packman_dead_wgt'
+
+
+from
+(
+select
+soi.suborder_Code,lower(soi.supc) as 'supc',sp.tracking_number,
+max(case when attribute_name = 'LENGTH' then value end) as "LENGTH",
+max(case when attribute_name = 'HEIGHT' then value end ) as "HEIGHT",
+max(case when attribute_name = 'BREADTH' then value end ) as "BREADTH",
+max(shp.manifest_weight) as 'Weight'
+from shipping_dwh.seller_package sp
+JOIN shipping_dwh.seller_item si on si.seller_package_id = sp.id
+join shipping_dwh.shipping_order_item soi on soi.suborder_Code = si.suborder_code
+join shipping_dwh.seller_package_detail spd on spd.seller_package_id = sp.id
+join shipping_dwh.shipping_package shp on shp.reference_code = sp.code
+join dwh.f_suborders_oms fso on fso.suborder_code = soi.suborder_code
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id 
+
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between current_date-140 and current_date-1
+--where date(soi.created) >= '2021-01-01'
+group by 1,2,3
+)dp
+)
+;
+
+
+drop table if exists packman_weight1;
+create local temp table packman_weight1 on commit preserve rows as
+(
+
+select 
+supc,
+--min(Packman_wgt) as 'Packman_vol_wgt',
+min(Packman_slab) as 'Packman_slab'
+--min()
+
+from packman
+group by 1
+)
+;
+
+
+
+
+drop table if exists packman_weight;
+create local temp table packman_weight on commit preserve rows as
+(
+
+select 
+p.supc,
+max(p.Packman_slab) as 'Packman_slab',
+max(p.Packman_wgt::float) as 'Packman_vol_wgt',
+max(p.Packman_dead_wgt::float) as 'Packman_dead_wgt'
+
+--min(Packman_wgt) as 'Packman_vol_wgt',
+--min(Packman_slab) as 'Packman_slab'
+--min()
+
+from packman p
+join packman_weight1 p1 on p1.supc = p.supc and p1.Packman_slab = p.Packman_slab
+group by 1
+)
+;
+
+
+
+
+
+
+drop table if exists final;
+create local temp table final on commit preserve rows as
+(
+select 
+s.supc,
+s.current_slab,
+s.current_wgt as 'Current_Vol_Wgt',
+
+case when sw.Mode_Slab is null then sw.min_Slab else sw.Mode_Slab end as 'Final_slab',
+case when sw.Mode_Slab is null then sw.min_weight else sw.Mode_max_vol_wgt end as 'Final_slab_Vol_wgt',
+case when sw.Mode_Slab is null then sw.Min_dead_wt else sw.Max_dead_wt end as 'Final_slab_Dead_wgt',
+pw.Packman_slab,
+pw.Packman_vol_wgt,
+pw.Packman_dead_wgt,
+
+count(distinct s.suborder_code) as 'Suborders_Booked',
+count(distinct case when fsp.sph_date_shipped is not null then s.suborder_Code end) as 'Shipped',
+count(distinct case when cg.courier_group= 'LAAP_SD' and fsp.sph_date_shipped is not null then s.suborder_Code end) as 'LAAP',
+count(distinct case when cg.courier_group IN ('DELHIVERY','ECOMM_EXP') and fsp.sph_date_shipped is not null then s.suborder_Code end) as 'delhivery_Ecom'
+--count(distinct case when cg.courier= 'ECO' and fsp.sph_date_shipped is not null then s.suborder_Code end) as 'LAAP',
+
+from system_slab s
+join dwh.f_suborders_oms fso on fso.suborder_code = s.suborder_code
+join dwh.d_product dp on dp.product_Sid = fso.product_sid
+left JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+left join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join supc_weight sw on sw.supc = dp.supc
+left join mode_weight mw on mw.supc = dp.supc
+left join packman_weight pw on pw.supc = dp.supc
+group by 1,2,3,4,5,6,7,8,9
+)
+;
+
+drop table if exists analytics_logistics.supc_weight_opportunity;
+create table analytics_logistics.supc_weight_opportunity as
+(
+select distinct 
+f.*,least(Final_slab,packman_slab,current_slab) as 'Estimated_slab',
+least(Final_slab_Vol_wgt,Packman_vol_wgt) as 'Estimated_Volumetrics_wgt',
+least(Final_slab_Dead_wgt,Packman_dead_wgt) as 'Estimated_Dead_wgt',
+current_slab-least(Final_slab,packman_slab,current_slab) as 'opportunity_slab' 
+from final f
+where current_slab > least(Final_slab,packman_slab,current_slab)
+)
+;
+
+<output_supress_end>
+
+
+select 
+'Last 7 days Shipped data' as 'Note'
+;
+
+select  * from analytics_logistics.supc_weight_opportunity limit 100;
+
+select 
+'LAST 7 Days Shipped Suborders Opportunity' as 'Metrics',
+sum(shipped) as 'Total_Opportunit_Suborders',
+sum(opportunity_slab) as 'Total_opportunity_slabs'
+
+from analytics_logistics.supc_weight_opportunity a
+;
+
+
+
+
+drop table if exists shipped;
+create local temp table shipped on commit preserve rows as
+(
+
+SELECT DISTINCT fso.suborder_code,
+date(sph.created) as 'Shipped_Date',
+dp.new_supercategory,
+dp.category_name,
+dp.subcategory_name
+from dwh.f_suborders_oms_archive fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+Left Join shipping_dwh.shipping_package_history sph on sph.package_id=fso.soi_shipping_package_id
+where date(sph.created) BETWEEN '2020-04-01' and '2021-10-25' and ((sph.previous_shipping_status_id = 50 and sph.shipping_status_id = 52) or (sph.previous_shipping_status_id = 58 and sph.shipping_status_id = 52))
+and dp.new_supercategory is not null
+and dp.category_name is not null
+and dp.subcategory_name is not null
+)
+;
+
+
+
+
+
+select 
+count(distinct suborder_Code) as 'suborders'
+from analytics_pricing.shipped_base_data_archive1
+where Shipped_Date between '2020-10-01' and '2020-10-25'
+;
+
+select
+month(Shipped_Date) as 'Month',
+Year(Shipped_Date) as 'Year',
+spc.pincode,
+spc.city,
+spc.state,
+spc.tier,
+spc.zone,
+dp.subcategory_name,
+dp.category_name,
+dp.new_supercategory,
+
+count(distinct fso.suborder_code) as 'Shipped_Suborders'
+
+from shipped s
+join dwh.f_suborders_oms fso on fso.suborder_code = s.suborder_code
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+where s.Shipped_Date between '2021-10-01' and '2021-10-25'
+group by 1,2,3,4,5,6,7
+limit 100000
+;
+
+
+select 
+
+date(s.Shipped_Date) as 'shipped_Date',
+--Month(s.Shipped_Date) as 'Month',
+--spc.city,
+count(distinct fso.suborder_code) as 'Shipped_Suborders'
+from shipped s
+join dwh.f_suborders_oms fso on fso.suborder_code = s.suborder_code
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+where s.Shipped_Date between '2021-08-01' and '2021-10-25'
+group by 1--,2
+
+;
+
+
+select 
+
+date(s.Shipped_Date) as 'shipped_Date',
+--Month(s.Shipped_Date) as 'Month',
+--spc.city,
+count(distinct fso.suborder_code) as 'Shipped_Suborders'
+from shipped s
+join dwh.f_suborders_oms fso on fso.suborder_code = s.suborder_code
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+where s.Shipped_Date between '2021-08-01' and '2021-10-25'
+group by 1--,2
+
+;
+
+-------------------------data1---------
+select 
+case when month(to_date(fso.subo_date_verified::varchar,'YYYYMMDD')) IN ('7','8','9') then 'July_To_Sep'
+     else 'October' end as 'Month',
+--date(s.Shipped_Date) as 'shipped_Date',
+--Month(s.Shipped_Date) as 'Month',
+spc.city,
+count(distinct fso.suborder_code) as 'Suborders'
+
+from dwh.f_suborders_oms fso
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+where to_date(fso.subo_date_verified::varchar,'YYYYMMDD') between '2021-07-01' and '2021-10-25'
+group by 1,2
+;
+---------------data2
+select
+spc.state,
+count(distinct fso.suborder_code) as 'suborders'
+from shipped s
+join dwh.f_suborders_oms fso on fso.suborder_code = s.suborder_code
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+where s.Shipped_Date between '2021-01-01' and '2021-10-25'
+group by 1
+;
+
+
+
+
+select
+spc.state,
+dp.categorygroup,
+dp.new_supercategory,
+count(distinct fso.suborder_code) as 'suborders'
+from shipped s
+join dwh.f_suborders_oms fso on fso.suborder_code = s.suborder_code
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+where s.Shipped_Date between '2021-01-01' and '2021-10-25'
+group by 1,2,3
+;
+
+
+
+
+drop table if exists fdds;
+create local temp table fdds on commit preserve rows as
+(
+select
+distinct --a1.suborder_code,
+a1.awb_number,
+a1.courier_code as 'code',
+date(a1.status_date) as status_date,
+
+a1.courier_group,
+a1.code as 'udl_code',
+r.courier_hub,
+--hm.courier_hub,
+spc2.state,
+a1.shipping_mode_code,
+--a1.ranking ,
+--a1.status
+
+case when a1.status ='DEL' and a1.ranking1 =1 then 'DEL'
+   when date(a1.status_date) = date(a2.status_date) and a1.status = 'UDL' and a2.status = 'DEL' then'DEL'
+   else a1.status end as 'Status'
+
+
+from RAD
+JOIN(select distinct r.*, row_number() over(partition by suborder_code order by status_time) as 'ranking1'
+--count(distinct ranking) as 'attempts' 
+from analytics_logistics.RTO_basedata_ys_v4 r
+where r.status IN ('UDL','DEL')
+AND ((r.code NOT IN ('UD_SD')) or (r.code is null))
+)a1 on r.awb_number = a1.awb_number
+left join (select distinct r.*, row_number() over(partition by suborder_code order by status_time) as 'ranking1'
+--count(distinct ranking) as 'attempts' 
+from analytics_logistics.RTO_basedata_ys_v4 r
+where r.status IN ('UDL','DEL')
+AND ((r.code NOT IN ('UD_SD')) or (r.code is null))
+)a2 on a1.suborder_code = a2.suborder_code and a2.ranking1 = 2
+--from analytics_logistics.RTO_basedata_ys_v4 a1
+--left join analytics_logistics.RTO_basedata_ys_v4 a2 on a1.suborder_code = a2.suborder_code and a2.ranking = 2
+join dwh.f_suborders_oms_vw fso on fso.suborder_code=a1.suborder_code
+JOIN dwh.d_product_vendor dpv ON dpv.vendor_sid= fso.vendor_sid
+left join cocofs_dwh.fc_details fcd on UPPER(fcd.code) = UPPER(fso.sho_fp_code)
+left join cocofs_dwh.fc_address_vw fca on fca.id = fcd.primary_address_id
+left JOIN analytics_logistics.score_postal_code spc2 ON spc2.pincode = fso.sd_pincode
+join dwh.f_shipping_package_vw fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+left join analytics_logistics.courier_hub_master_nb hm on fso.sd_pincode=hm.pincode and a1.courier_group=hm.courier_group
+where a1.ranking1 = 1
+and fsp.sph_date_shipped is not null
+AND fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O')
+AND (fso.subo_store_front <> 'EXL' OR fso.subo_store_front IS NULL)
+and a1.status_date between current_date-160 and current_date-1
+and a1.status in ('UDL','DEL')
+--and a1.courier_group in ('LAAP_SD')
+--and ((date(a1.status_date) = date(a2.status_date) and a1.status = 'UDL' and a2.status = 'DEL') or (a1.code <> 'UD_SD') or (a1.code is null))
+
+)
+;
+
+
+drop table if exists rad_ekart;
+create local temp table rad_ekart on commit preserve rows as
+(
+select distinct
+fso.suborder_code,
+cg.courier_group, 
+tph1.current_location as 'courier_hub', 
+tph1.status_date as rad_date, 
+1 as 'priority'
+
+
+FROM dwh.f_suborders_oms_vw fso   
+JOIN dwh.f_shipping_package_vw fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+left join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+JOIN shiptrack_dwh.tracking_package_vw tp ON tp.reference_code = fsp.sp_reference_code AND tp.tracking_type NOT IN ('RMS','RMS_RTV')
+join(select tracking_package_id,min(tph.status_date) as 'status_date'
+from shiptrack_dwh.tracking_package_history_vw tph
+where tph.current_courier_status = 'received_at_dh'
+group by 1) tph ON tph.tracking_package_id = tp.id
+join shiptrack_dwh.tracking_package_history_vw tph1 on tph1.tracking_package_id = tph.tracking_package_id and tph1.status_Date = tph.status_date
+where date(tph1.status_Date) between  current_date - 180 and current_date - 1
+and cg.courier_group = 'EKART'
+)
+;
+
+
+
+drop table if exists ayu2;
+create local temp table ayu2 on commit preserve rows as
+(
+select distinct
+fsp.sp_tracking_number as 'awb_number',
+--r.rad_Date,
+cg.courier_group,
+cg.code,
+ifnull(to_date(fsp.sph_date_return::varchar,'YYYYMMDD'),to_date(fso.soih_date_return_accepted::varchar,'YYYYMMDD')) as 'rto_date',
+r1.status_date
+
+from dwh.f_suborders_oms_vw fso
+join dwh.f_shipping_package_vw fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+--join RAD  r on r.awb_number = fsp.sp_tracking_number
+left join
+(select awb_number,min(status_date) as 'status_date' from analytics_logistics.rto_basedata_ys_as_v4
+where status IN ('UDL','DEL')
+AND ((code NOT IN ('UD_SD')) or (code is null))
+group by 1
+)r1 on r1.awb_number = fsp.sp_tracking_number --r.awb_number 
+where ifnull(to_date(fsp.sph_date_return::varchar,'YYYYMMDD'),to_date(fso.soih_date_return_accepted::varchar,'YYYYMMDD')) between current_date-150 and current_date-1
+AND fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O')
+AND (fso.subo_store_front <> 'EXL' OR fso.subo_store_front IS NULL)
+and fsp.sph_date_shipped is not null
+)
+;
+
+
+select * from ayu2 where courier_group = 'EKART' and date(rto_date) = current_date-1;
+
+
+
+
+
+select 
+case when spc.city IN ('NEW DELHI','MUMBAI','HYDERABAD','BANGALORE','AHMEDABAD','CHENNAI','KOLKATA') then 'Metro'
+     when spc.city IN ('AGRA','ALLAHABAD','AMRITSAR','AURANGABAD','BHOPAL','COIMBATORE','DHANBAD','FARIDABAD',
+'GWALIOR',
+'INDORE',
+'JABALPUR',
+'JAIPUR',
+'JODHPUR',
+'KANPUR',
+'KOTA',
+'LUCKNOW',
+'LUDHIANA',
+'MADURAI',
+'MEERUT',
+'NAGPUR',
+'NASHIK',
+'NAVI MUMBAI',
+'PATNA',
+'PUNE',
+'RAIPUR',
+'RAJKOT',
+'RANCHI',
+'SRINAGAR',
+'SURAT',
+'THANE',
+'VADODARA',
+'VARANASI',
+'VIJAYAWADA',
+'VISHAKHAPATNAM') then 'Tier1'
+else 'Tier2' end as 'Tier',
+--count(distinct fso.suborder_code) as 'suborders',
+count(distinct case when s.Shipped_Date between '2021-10-01' and '2021-10-25' then fso.suborder_code end) as 'Oct_21_Shipped',
+count(distinct case when s.Shipped_Date between '2020-10-01' and '2020-10-25' then fso.suborder_code end) as 'Oct_20_Shipped'
+
+
+from shipped s
+join dwh.f_suborders_oms fso on fso.suborder_code = s.suborder_code
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+where s.Shipped_Date between '2020-09-01' and '2021-10-25'
+group by 1
+;
+
+
+select * from analytics_pricing.shipped_base_data_quarter2 limit 100;
+
+--select datediff('MI','2020-09-01 00:00:00'::timestamp,'2020-09-01 23:59:59'::timestamp)
+
+
+select * from  analytics_logistics.RS_UDL_Instruction_History where suborder_Code = '48622266730' limit 100;
+select * from analytics_logistics.RS_UDL_Instruction_History where last_UD_bucket = 'UD_CROTP' limit 100; an suborder_code = '48622266730';
+
+select distinct e.code from cre_dwh.event e limit 1000;
+
+
+
+
+select 
+case when dest_city IN ('NEW DELHI','MUMBAI','HYDERABAD','BANGALORE','AHMEDABAD','CHENNAI','KOLKATA') then 'Metro'
+     when dest_city IN ('AGRA','ALLAHABAD','AMRITSAR','AURANGABAD','BHOPAL','COIMBATORE','DHANBAD','FARIDABAD',
+'GWALIOR',
+'INDORE',
+'JABALPUR',
+'JAIPUR',
+'JODHPUR',
+'KANPUR',
+'KOTA',
+'LUCKNOW',
+'LUDHIANA',
+'MADURAI',
+'MEERUT',
+'NAGPUR',
+'NASHIK',
+'NAVI MUMBAI',
+'PATNA',
+'PUNE',
+'RAIPUR',
+'RAJKOT',
+'RANCHI',
+'SRINAGAR',
+'SURAT',
+'THANE',
+'VADODARA',
+'VARANASI',
+'VIJAYAWADA',
+'VISHAKHAPATNAM') then 'Tier1'
+else 'Tier2' end as 'Tier',
+
+count(distinct a.suborder_code) as 'Shipped_SubOrders',
+sum(a.subo_selling_price) as 'Shipped_GSV'
+
+from analytics_pricing.shipped_base_data_quarter2 a
+group by 1
+;
+
+select * from analytics_pricing.shipped_base_data_quarter2 limit 100;
+
+pincode
+city
+state
+tier
+zone
+shipped suborders
+shippes gsv
+
+;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+drop table if exists soid;
+CREATE LOCAL TEMP TABLE soid ON COMMIT PRESERVE ROWS AS 
+(select
+fso.soi_id
+, MAX(CASE WHEN soid.attribute_name IN ('LENGTH') then soid.value::float else null end) as 'LENGTH'
+, MAX(CASE WHEN soid.attribute_name IN ('BREADTH') then soid.value::float else null end) as 'BREADTH'
+, MAX(CASE WHEN soid.attribute_name IN ('HEIGHT') then soid.value::float else null end) as 'HEIGHT'
+FROM dwh.f_suborders_oms fso
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id 
+join shipping_dwh.soi_detail soid on soid.soi_id = fso.soi_id and soid.attribute_name IN ('LENGTH','BREADTH','HEIGHT')
+where to_date(fso.subo_date_created::varchar,'YYYYMMDD') >='2021-01-01'
+group by 1
+);
+
+
+
+drop table if exists system_slab;
+create local temp table system_Slab on commit preserve rows as
+(
+select distinct 
+fso.suborder_code,
+cg.courier_group,
+dp.supc,
+CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float))/5)/500) as 'system_slab',
+CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float))/5)) as 'system_Weight',
+
+CEILING(greatest(dp.pa_weight::float,(dp.pa_length::float*dp.pa_breadth::float*dp.pa_height::float)/5)/500) as 'current_slab',
+CEILING(greatest(dp.pa_weight::float,(dp.pa_length::float*dp.pa_breadth::float*dp.pa_height::float)/5)) as 'current_wgt'
+
+--CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float)/5))) as 'current_Weight'
+
+
+
+from dwh.f_suborders_oms_vw fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join soid on soid.soi_id = fso.soi_id
+left join dwh.d_product_vendor dpv on dpv.vendor_sid = fso.vendor_sid
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id 
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fso.shipping_provider_sid and cg.transit_type_code = 'Forward'
+
+where to_date(fsp.sph_date_shipped::varchar,'YYYYMMDD') between '2021-11-01' and '2021-11-24'
+);
+
+
+select distinct
+courier_group,
+case 
+when system_Weight <=500 then '<=500'
+when system_Weight between 501 and 600 then '501-600'
+else 'Others' end as 'Weight',
+count(distinct suborder_Code) as 'Suborders'
+
+from system_slab
+group by 1,2
+; 
+
+
+
+
+
+drop table if exists soid;
+CREATE LOCAL TEMP TABLE soid ON COMMIT PRESERVE ROWS AS
+(select
+fso.soi_id
+, MAX(CASE WHEN soid.attribute_name IN ('LENGTH') then soid.value::float else null end) as 'LENGTH'
+, MAX(CASE WHEN soid.attribute_name IN ('BREADTH') then soid.value::float else null end) as 'BREADTH'
+, MAX(CASE WHEN soid.attribute_name IN ('HEIGHT') then soid.value::float else null end) as 'HEIGHT'
+FROM dwh.f_suborders_oms fso
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id
+join shipping_dwh.soi_detail soid on soid.soi_id = fso.soi_id and soid.attribute_name IN ('LENGTH','BREADTH','HEIGHT')
+where to_date(fso.subo_date_created::varchar,'YYYYMMDD') >='2021-01-01'
+group by 1
+);
+
+
+CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float))/5)/500) as 'system_slab',
+CEILING(greatest(IFNULL(fso.soi_weight,dp.pa_weight::float), (IFNULL(soid.LENGTH,dp.pa_length::float)*IFNULL(soid.BREADTH,dp.pa_breadth::float)*IFNULL(soid.HEIGHT,dp.pa_height::float))/5)) as 'system_Weight',
+
+
+grant all on analytics_logistics.suborder_mobile_data_next_qtr_mar_22 to public;
+
+
+select * from analytics_logistics.dropout_dump_2504 order by 1 limit 100;
+
+select count(distinct ims_user_id),count(*) from analytics_logistics.suborder_mobile_data_next_qtr_mar_22 limit 100;
+
+select count(distinct ims_user_id) from analytics_logistics.shipped_base_data_quarter4;
+
+select * from dwh.f_suborders_oms_vw where order_code = '9923993858'
+
+
+select * from salesforce_dwh.sf_vendor_case limit 100;
+
+
+
+
+
+
+
+
+
+
+
+
+drop table if exists soid;
+CREATE LOCAL TEMP TABLE soid ON COMMIT PRESERVE ROWS AS
+(select
+fso.soi_id
+, MAX(CASE WHEN soid.attribute_name IN ('LENGTH') then soid.value::float else null end) as 'LENGTH'
+, MAX(CASE WHEN soid.attribute_name IN ('BREADTH') then soid.value::float else null end) as 'BREADTH'
+, MAX(CASE WHEN soid.attribute_name IN ('HEIGHT') then soid.value::float else null end) as 'HEIGHT'
+FROM dwh.f_suborders_oms fso
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id
+join shipping_dwh.soi_detail soid on soid.soi_id = fso.soi_id and soid.attribute_name IN ('LENGTH','BREADTH','HEIGHT')
+where to_date(fso.subo_date_created::varchar,'YYYYMMDD') >='2021-01-01'
+group by 1
+);
+
+
+select distinct
+fso.suborder_code,
+to_date(fso.subo_date_created::varchar,'YYYYMMDD')  as 'Order_created',
+dp.supc,
+soid.LENGTH,
+soid.BREADTH,
+soid.HEIGHT,
+fso.soi_weight
+
+from dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id = fsp.sp_shipping_package_id
+join soid on soid.soi_id = fso.soi_id
+where to_date(fso.subo_date_created::varchar,'YYYYMMDD') between '2022-07-05' and '2022-07-06'
+and fsp.sph_date_manifest is not null
+;
+
+
+
