@@ -1,0 +1,2814 @@
+CREATE LOCAL TEMP TABLE fv1 ON COMMIT PRESERVE ROWS AS
+(SELECT  DISTINCT
+fso.suborder_code,
+MIN(tph.status_date) AS 'first_attempt_date'
+FROM dwh.f_suborders_oms fso
+join oms.suborder sub on fso.suborder_code = sub.code
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+JOIN shiptrack_dwh.tracking_package tp ON tp.reference_code = fsp.sp_reference_code AND tp.tracking_type NOT IN ('RMS','RMS_RTV')
+JOIN shiptrack_dwh.tracking_package_history tph ON tph.tracking_package_id = tp.id AND tph.new_status IN ('DEL','UDL','RTI','RTC','R-IN','R-ITR','R-OFD','R-OUT','RUD')
+where  to_date(fso.subo_date_created::varchar,'YYYYMMDD')  between current_date - 200 and current_date -1
+GROUP BY 1
+);
+
+
+
+drop table if exists analytics_logistics.ds_service;
+Create table analytics_logistics.ds_service as
+Select distinct sp.code,
+          case when sl.shipping_method_id = 1 then 'STD'
+           when sl.shipping_method_id = 2 then 'COD' end As payment_mode,
+           cpl.pincode as origin_pincode,
+           sl.pincode as destination_pincode              
+from score_dwh.courier_pickup_location cpl
+join score_dwh.shipping_provider_vw sp on sp.code =  cpl.shipping_provider_code
+join analytics_logistics.courier_group cg on upper(cg.code) = upper(sp.code) 
+join score_dwh.shipping_location sl on sl.shipping_provider_id =sp.id 
+where cpl.enabled = 1 and sl.enabled = 1 
+;
+drop table if exists analytics_logistics.nonds_service;
+ Create table analytics_logistics.nonds_service as
+Select distinct sp.code,
+          case when sl.shipping_method_id = 1 then 'STD'
+           when sl.shipping_method_id = 2 then 'COD' end As payment_mode,
+           fcm.fc_code,
+           sl.pincode as destination_pincode              
+from score_dwh.fc_courier_mapping fcm  
+join score_dwh.shipping_provider_vw sp on upper(sp.code) =  upper(fcm.shipping_provider_code)
+join analytics_logistics.courier_group cg on upper(cg.code) = upper(fcm.shipping_provider_code)
+join score_dwh.shipping_location sl on sl.shipping_provider_id =sp.id 
+where fcm.enabled = 1 and sl.enabled = 1 
+;
+
+drop table analytics_logistics.service_data_16_31;
+create table analytics_logistics.service_data_16_31 as
+(
+
+select distinct
+nms.suborder_code,
+nms.courier_code as 'Actual_courier',
+upper(case when nms.FM = 'DROPSHIP' then ds.code else CS.code end) as Serviceable_courier,
+cg.shipping_mode_code
+
+
+
+from dwh.f_suborders_oms fso
+join analytics_logistics.nmpu_suborders nms on nms.suborder_code  = fso.suborder_code
+left join analytics_logistics.ds_service DS on ds.origin_pincode::Varchar = nms.origin_pincode  and nms.destination_pincode = ds.destination_pincode::varchar and ds.payment_mode = nms.payment_mode and nms.FM = 'DROPSHIP' 
+left join analytics_logistics.nonds_service CS on CS.fc_code = nms.center_code and nms.destination_pincode = CS.destination_pincode::varchar and cs.payment_mode = nms.payment_mode and nms.FM in ('FC_VOI','ONESHIP','OCPLUS')
+left join analytics_logistics.courier_group cg on upper(cg.code) = upper(case when nms.FM = 'DROPSHIP' then ds.code else CS.code end) and cg.shipping_mode_code = nms.shipping_mode_courier and cg.transit_type_code = 'Forward'
+where date(nms.verified_date) between '2018-12-16' and '2018-12-31'
+)
+;
+
+
+delete from analytics_logistics.service_data_16_31 where shipping_mode_code is null;
+
+
+drop table analytics_logistics.final_service_data_16_31;
+create table analytics_logistics.final_service_data_16_31 as
+(
+select distinct t1.*
+from
+(SELECT * 
+from analytics_logistics.service_data_16_31
+UNION
+SELECT 
+nms.suborder_code,
+nms.courier_code as 'Actual_courier',
+nms.courier_code as 'Serviceable_courier',
+nms.shipping_mode_courier
+
+from dwh.f_suborders_oms fso
+join analytics_logistics.nmpu_suborders nms on nms.suborder_code  = fso.suborder_code
+where date(nms.verified_date) between '2018-12-16' and '2018-12-31'
+) t1
+)
+;
+
+
+
+
+
+drop table if exists a;
+create local temp table a on commit preserve rows as
+(
+select distinct
+fso.suborder_code,
+fso.subo_shipping_method_code as 'Payment_mode',
+nms.shipping_mode_courier as 'shipping_mode',
+spc.pincode as 'dest_pincode',
+spc.city as 'dest_city',
+spc.state as 'dest_state',
+spc.tier as 'dest_tier',
+spc.zone as 'dest_zone',
+spc.sc_city as 'dest_sc_city',
+spc.sc_state as 'dest_sc_state',
+spc.sc_tier as 'dest_sc_tier',
+
+spc1.pincode as 'origin_pincode',
+spc1.city as 'origin_city',
+spc1.state as 'origin_state',
+spc1.tier as 'origin_tier',
+spc1.zone as 'origin_zone',
+spc1.sc_city as 'origin_sc_city',
+spc1.sc_state as 'origin_sc_state',
+spc1.sc_tier as 'origin_sc_tier',
+nms.proposed_slab,
+nms.subo_offer_price,
+ifnull(margin,0) as 'Margin',
+ifnull(nms.closing_fee,0) as 'closing_fee',
+ifnull(Logistic_fee,0) as 'Logistic_fee',
+ifnull(fulfillment_charges,0) as 'fulfillment_charges',
+
+IFNULL(nms.processing_cost_variable_1,0) as 'Processing_cost',
+IFNULL(nms.pg_cost,0) as 'pg_cost',
+IFNULL(nms.rto_lmc_adj_cost,0) as 'rto_cost',
+IFNULL(nms.fwd_lmc_adj_cost,0) as 'fwd_cost',
+IFNULL(nms.cod_collection_cost_adj,0) as 'COD_Cost',
+nms.courier_code,
+nms.courier_group,
+
+datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) as 'O2A'
+
+FROM dwh.f_suborders_oms fso
+join analytics_logistics.nmpu_suborders nms on nms.suborder_code = fso.suborder_code
+--join dwh.d_product dp on dp.product_sid = fso.product_sid
+--join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join analytics_logistics.score_postal_code spc1 on spc1.pincode = nms.origin_pincode
+--join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join fv1 on fv1.suborder_code = fso.suborder_code
+where date(nms.verified_date) between '2018-12-16' and '2018-12-31'
+--and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O','DIGITAL')
+);
+
+
+drop table if exists a1;
+create local temp table a1 on commit preserve rows as
+(
+select distinct
+a.*,
+b.Serviceable_courier,
+cg.courier_group as 'courier_group1'
+
+FROM a
+left join analytics_logistics.final_service_data_16_31 b on b.suborder_code = a.suborder_code
+left join analytics_logistics.courier_group cg on upper(cg.code) = upper(b.Serviceable_courier) and cg.transit_type_code = 'Forward'
+)
+;
+
+drop table if exists rate_card;
+create local temp table rate_card on commit preserve rows as
+(
+select distinct
+a.*,
+min(crm.priority) as 'priority'
+FROM a1 a
+left join analytics_logistics.new_pincode_cluster_mapping opcm on opcm.pincode = a.origin_pincode and a.shipping_mode = opcm.shipping_mode and upper(a.courier_group1) = upper(opcm.courier_group)
+left join analytics_logistics.new_pincode_cluster_mapping dpcm on dpcm.pincode = a.dest_pincode and a.shipping_mode = dpcm.shipping_mode and upper(a.courier_group1) = upper(dpcm.courier_group)
+join analytics_logistics.new_cluster_ratecard_mapping crm on upper(crm.source_cluster) = upper(opcm.cluster) and upper(crm.destination_cluster) = upper(dpcm.cluster) and upper(a.Serviceable_courier) = upper(crm.courier_code)
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35
+)
+;
+
+drop table if exists rate_card1;
+
+create local temp table rate_card1 on commit preserve rows as
+(
+select distinct
+a.*,
+crm.source_cluster,crm.destination_cluster,crm.rate_card,crm.priority
+FROM a1 a
+left join analytics_logistics.new_pincode_cluster_mapping opcm on opcm.pincode = a.origin_pincode and a.shipping_mode = opcm.shipping_mode and upper(a.courier_group1) = upper(opcm.courier_group)
+left join analytics_logistics.new_pincode_cluster_mapping dpcm on dpcm.pincode = a.dest_pincode and a.shipping_mode = dpcm.shipping_mode and upper(a.courier_group1) = upper(dpcm.courier_group)
+join analytics_logistics.new_cluster_ratecard_mapping crm on upper(crm.source_cluster) = upper(opcm.cluster) and upper(crm.destination_cluster) = upper(dpcm.cluster) and upper(a.Serviceable_courier) = upper(crm.courier_code)
+)
+;
+
+drop table if exists analytics_logistics.final_rate_card_16_31;
+create table analytics_logistics.final_rate_card_16_31 as
+(
+select 
+a.*,
+b.rate_card,
+b.destination_cluster,
+b.source_cluster
+FROM rate_card a
+join rate_card1 b on b.suborder_code = a.suborder_code and b.priority = a.priority and upper(a.Serviceable_courier) = upper(b.Serviceable_courier)
+
+)
+;
+
+drop table if exists analytics_logistics.final_rate_card1_16_31;
+create table analytics_logistics.final_rate_card1_16_31 as
+(
+SELECT distinct a.*,
+b.rate_card,
+null::float as 'fwd_cost1',
+null::float as 'rto_cost1',
+null::float as 'cod_cost1'
+
+--b.destination_cluster,
+--b.source_cluster
+
+FROM a1 a
+left join analytics_logistics.final_rate_card_16_31 b on b.suborder_code = a.suborder_code and b.Serviceable_courier = a.Serviceable_courier
+)
+;
+
+
+
+
+
+------------------------------------------------------------------------------------
+
+
+
+
+
+
+update analytics_logistics.final_rate_card1_16_31
+set rate_card = 'Default'
+where rate_card is null
+;
+
+update analytics_logistics.final_rate_card1_16_31 cbc
+set Rate_card = abc.rate_card
+from(Select rate_card,courier_code from analytics_logistics.lego_rate_slab_ecom rc 
+     where rate_card_type = 'SHIPPING_CHARGE'
+     and rate_card ilike '%Default%'
+     group by 1,2) abc
+where cbc.Rate_card = 'Default'
+and upper(abc.courier_code) = upper(cbc.Serviceable_courier) 
+;
+
+
+
+delete from analytics_logistics.final_rate_card1_16_31
+where  Serviceable_courier = 'FEDEX_HV'
+;
+
+update analytics_logistics.final_rate_card1_16_31 cbc
+set fwd_cost1 = rc.slab_rate + case when /*cbc.lego_wt*/(cbc.proposed_slab*500) > rc.slab_end then CEILING(((cbc.proposed_slab*500) - rc.slab_end)/rc.additional_slab_end)* rc.additional_slab_rate else 0 end
+from analytics_logistics.lego_rate_slab_ecom rc 
+where replace(replace(upper(rc.rate_card),' ','_'),'__','_') =replace(replace(upper(cbc.rate_card),' ','_'),'__','_') 
+and upper(rc.courier_code) = upper(cbc.Serviceable_courier) 
+and rc.rate_card_type = 'SHIPPING_CHARGE'
+and (cbc.fwd_cost1 is null or cbc.fwd_cost1 = 0)
+and rc.Filter2 = 1
+;
+
+update analytics_logistics.final_rate_card1_16_31 cbc
+set fwd_cost1 = rc.slab_rate
+from analytics_logistics.lego_rate_slab_ecom rc 
+where replace(replace(upper(rc.rate_card),' ','_'),'__','_') =replace(replace(upper(cbc.rate_card),' ','_'),'__','_')
+and upper(cbc.Serviceable_courier) = upper(rc.courier_code) 
+and rc.rate_card_type = 'SHIPPING_CHARGE'
+AND (cbc.fwd_cost1 is null or cbc.fwd_cost1 = 0)
+and ceil((cbc.proposed_slab*500)) between rc.slab_start+1 and rc.slab_end 
+and rc.Filter2 = 2
+;
+
+
+update analytics_logistics.final_rate_card1_16_31 cbc
+set fwd_cost1 = case when (cbc.proposed_slab*500) between rc.slab_start and rc.slab_end then rc.slab_rate else 0 end + case when (cbc.proposed_slab*500) > rc.slab_end then ifnull(CEILING(((cbc.proposed_slab*500) - rc.slab_end)/rc.additional_slab_end)* rc.additional_slab_rate,0) +ifnull(rc.slab_rate,0) else 0 end
+from analytics_logistics.lego_rate_slab_ecom rc 
+where replace(replace(upper(rc.rate_card),' ','_'),'__','_') =replace(replace(upper(cbc.rate_card),' ','_'),'__','_') 
+and upper(rc.courier_code) = upper(cbc.Serviceable_courier)
+and rc.rate_card_type = 'SHIPPING_CHARGE'
+AND (cbc.fwd_cost1 is null or cbc.fwd_cost1 = 0)
+and rc.Filter2 = 3
+;
+
+
+alter table analytics_logistics.final_rate_card1_16_31 add column soi_collectable_amount float;
+update analytics_logistics.final_rate_card1_16_31 cbc
+set soi_collectable_amount = null;
+
+UPDATE analytics_logistics.final_rate_card1_16_31 cbc
+set soi_collectable_amount = fso.soi_collectable_amount
+from dwh.f_suborders_oms fso
+where fso.suborder_code = cbc.suborder_code
+;
+
+
+alter table analytics_logistics.final_rate_card1_16_31 add column act_courier_group varchar(100);
+update analytics_logistics.final_rate_card1_16_31 cbc
+set a_courier_group = null;
+
+UPDATE analytics_logistics.final_rate_card1_16_31 cbc
+set act_courier_group = case when courier_code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when courier_code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else 'Others' end
+;
+
+
+
+alter table analytics_logistics.final_rate_card1_16_31 add column serv_courier_group varchar(100);
+--update analytics_logistics.final_rate_card1_16_24 cbc
+--set a_courier_group = null
+
+UPDATE analytics_logistics.final_rate_card1_16_31 cbc
+set serv_courier_group = case when Serviceable_courier in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group1='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when Serviceable_courier ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group1='BLUEDART' THEN 'BLUEDART'
+when courier_group1 in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group1 else courier_group1 end
+;
+
+
+
+
+-------update RTO_Cost
+update analytics_logistics.final_rate_card1_16_31 cbc
+set rto_cost1 = rc.slab_rate + case when (cbc.proposed_slab*500) > rc.slab_end then CEILING(((cbc.proposed_slab*500) - rc.slab_end)/rc.additional_slab_end)* rc.additional_slab_rate else 0 end
+from analytics_logistics.lego_rate_slab_ecom rc 
+where replace(replace(upper(rc.rate_card),' ','_'),'__','_') =replace(replace(upper(cbc.rate_card),' ','_'),'__','_')  
+and upper(rc.courier_code) = upper(cbc.Serviceable_courier)
+and rc.rate_card_type = 'RTO_CHARGE'
+AND (cbc.rto_cost1 is null or rto_cost1 = 0) 
+and rc.Filter2 = 1
+;
+
+
+
+
+update analytics_logistics.final_rate_card1_16_31 cbc
+set rto_cost1 = case when rc.cost_type = 'PERCENTAGE' and percentage_of = 'COLLECTABLE_AMOUNT' then rc.percentage * cbc.soi_collectable_amount/100
+                      when rc.cost_type = 'PERCENTAGE' and percentage_of = 'SHIPPING_CHARGE' then rc.percentage * cbc.fwd_cost1/100
+                      when rc.cost_type = 'FLAT' then rc.flat_cost  
+                      else 0 end
+from analytics_logistics.lego_rate_non_slab rc 
+where upper(rc.rate_card) =upper(cbc.rate_card) 
+and upper(rc.courier_code) = upper(cbc.Serviceable_courier) 
+and rc.rate_card_type = 'RTO_CHARGE'
+AND (cbc.rto_cost1 is null or rto_cost1 = 0) 
+;
+
+
+
+
+update analytics_logistics.final_rate_card1_16_31 cbc
+set cod_cost1 = case when cod_r.cost_type = 'PERCENTAGE' then least(cod_r.percentage*cbc.soi_collectable_amount/100,cod_r.max_cost)
+     when cod_r.cost_type = 'FLAT' then least(cod_r.flat_cost,cod_r.max_cost)
+      when cod_r.cost_type = 'MAX' then least(greatest(cod_r.flat_cost,cod_r.percentage*cbc.soi_collectable_amount/100),cod_r.max_cost)
+      when cod_r.cost_type = 'MIN' then least(least(cod_r.flat_cost,cod_r.percentage*cbc.soi_collectable_amount/100),cod_r.max_cost)
+      else 0 end
+from analytics_logistics.lego_rate_non_slab cod_r 
+Where replace(replace(upper(cod_r.rate_card),' ','_'),'__','_') =replace(replace(upper(cbc.rate_card),' ','_'),'__','_')   
+and upper(cod_r.courier_code) = upper(cbc.Serviceable_courier)
+and cod_r.rate_card_type = 'COD_CHARGE' 
+and cbc.payment_mode = 'COD'
+;
+update analytics_logistics.final_rate_card1_16_31 cbc
+set cod_cost1 = 1.2*cbc.soi_collectable_amount/100 
+Where upper(cbc.Serviceable_courier) in ('DELHIVERY_DPP','DELHIVERY')
+and cbc.payment_mode = 'COD'
+; 
+
+
+-------------------update cost for ecom ros pincodes
+Alter table analytics_logistics.final_rate_card1_16_31 add column is_ecom_ros boolean;
+update  analytics_logistics.final_rate_card1_16_31 sca
+set is_ecom_ros = 1
+from (select sca.suborder_code,
+sca.courier_group1
+from analytics_logistics.final_rate_card1_16_31 sca
+left join  analytics_logistics.ecom_ros_pincodes a on a.pincode = sca.origin_pincode
+left join  analytics_logistics.ecom_ros_pincodes b on b.pincode = sca.dest_pincode
+where (a.pincode is not null or b.pincode is not null)
+and sca.courier_group1 = 'ECOMM_EXP' 
+and sca.rate_card not in ('ECOM_PLUS-ECOM_INTRA_CITY','ECOM_PLUS-ECOM_METRO_METRO','ECOMM_EXP-ECOM_INTRA_CITY','ECOMM_EXP-ECOM_METRO_METRO')
+ group by 1,2)a
+ where a.suborder_code = sca.suborder_code and a.courier_group1 = sca.courier_group1;
+
+
+--select * from analytics_logistics.sca_august_new limit 100;
+ ----------update final fwd and cod cost with new ecom rate cards
+alter table analytics_logistics.final_rate_card1_16_31 add column fwdCostNew2 float;
+alter table analytics_logistics.final_rate_card1_16_31 add column CodCostNew2 float;
+-----ecom ros charges
+Update analytics_logistics.final_rate_card1_16_31 set fwdCostNew2 = case when is_ecom_ros = 1 then fwd_cost1 + 4 + ceil(((proposed_slab*500)-500)/500)*3 else fwd_cost1 end;
+-------BD idc charges
+Update analytics_logistics.final_rate_card1_16_31 set fwdCostNew2 =  (case when rate_card in ('BLUEDART-BD_METRO_METRO','BLUEDART-BD_ROI','BLUEDART-default','BLUEDART-SPECAIL_ZONE') then fwdCostNew2*153/150
+                      when Serviceable_courier in ('BD_ETAIL','BLUEDART') then fwdCostNew2*1.03
+                      else fwdCostNew2 end);
+
+
+Update analytics_logistics.final_rate_card1_16_31 set CodCostNew2 = case when courier_group1 = 'ECOMM_EXP' then greatest(soi_collectable_amount*1.5/100,17) else cod_cost1 end;
+
+
+grant all on analytics_logistics.final_rate_card1_16_31 to public;
+
+
+SELECT * FROM analytics_logistics.final_rate_card1_16_31 order by 1 limit 100;
+---------------------------------------------O2A--------------------
+
+
+
+
+
+drop table if exists fv1;
+CREATE LOCAL TEMP TABLE fv1 ON COMMIT PRESERVE ROWS AS
+(SELECT  DISTINCT
+fso.suborder_code,
+MIN(tph.status_date) AS 'first_attempt_date'
+FROM dwh.f_suborders_oms fso
+join oms.suborder sub on fso.suborder_code = sub.code
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+JOIN shiptrack_dwh.tracking_package tp ON tp.reference_code = fsp.sp_reference_code AND tp.tracking_type NOT IN ('RMS','RMS_RTV')
+JOIN shiptrack_dwh.tracking_package_history tph ON tph.tracking_package_id = tp.id AND tph.new_status IN ('DEL','UDL','RTI','RTC','R-IN','R-ITR','R-OFD','R-OUT','RUD')
+where  to_date(fso.subo_date_created::varchar,'YYYYMMDD')  between current_date - 200 and current_date -1
+GROUP BY 1
+);
+
+
+
+drop table if exists m1;
+CREATE LOCAL TEMP TABLE m1 on commit preserve rows as
+(
+
+select distinct
+spc1.pincode as origin_pincode,
+fso.sd_pincode as dest_pincode,
+
+spc1.sc_city as sc_city_origin,
+spc2.sc_city as sc_city_dest,
+
+spc1.sc_state as sc_state_origin,
+spc2.sc_state as sc_state_dest,
+
+
+spc1.sc_tier as sc_tier_origin,
+spc2.sc_tier as sc_tier_dest,
+
+spc1.city as city_origin,
+spc2.city as city_dest,
+
+spc2.zone as zone_dest,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group,
+cg.shipping_mode_code,
+'Dec 01- Dec 15' as 'period',
+1 as 'rank',
+
+sum(datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date))) as total_o2a,
+count(fso.suborder_Code) as total_suborders
+
+
+
+from dwh.f_suborders_oms fso 
+JOIN dwh.d_product_vendor dpv ON dpv.vendor_sid = fso.vendor_sid
+left join cocofs_dwh.fc_details fcd on UPPER(fcd.code) = UPPER(fso.sho_fp_code)
+left join cocofs_dwh.fc_address fca on fca.id = fcd.primary_address_id
+left JOIN analytics_logistics.score_postal_code spc1 ON spc1.pincode=IFNULL(fca.pincode,dpv.pin_code_contact_type_4)
+left JOIN analytics_logistics.score_postal_code spc2 ON spc2.pincode = fso.sd_pincode--DESTINATION
+
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+join fv1 on fv1.suborder_code = fso.suborder_code
+where date(fv1.first_attempt_date) between '2018-12-01' and '2018-12-15'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O','DIGITAL')
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+UNION
+
+select distinct
+spc1.pincode as origin_pincode,
+fso.sd_pincode as dest_pincode,
+
+spc1.sc_city as sc_city_origin,
+spc2.sc_city as sc_city_dest,
+
+spc1.sc_state as sc_state_origin,
+spc2.sc_state as sc_state_dest,
+
+
+spc1.sc_tier as sc_tier_origin,
+spc2.sc_tier as sc_tier_dest,
+
+spc1.city as city_origin,
+spc2.city as city_dest,
+
+spc2.zone as zone_dest,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group,
+cg.shipping_mode_code,
+'Nov 16- Dec 15' as 'period',
+2 as 'rank',
+
+sum(datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date))) as total_o2a,
+count(fso.suborder_Code) as total_suborders
+
+
+
+from dwh.f_suborders_oms fso 
+JOIN dwh.d_product_vendor dpv ON dpv.vendor_sid = fso.vendor_sid
+left join cocofs_dwh.fc_details fcd on UPPER(fcd.code) = UPPER(fso.sho_fp_code)
+left join cocofs_dwh.fc_address fca on fca.id = fcd.primary_address_id
+left JOIN analytics_logistics.score_postal_code spc1 ON spc1.pincode=IFNULL(fca.pincode,dpv.pin_code_contact_type_4)
+left JOIN analytics_logistics.score_postal_code spc2 ON spc2.pincode = fso.sd_pincode--DESTINATION
+
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+join fv1 on fv1.suborder_code = fso.suborder_code
+where date(fv1.first_attempt_date) between '2018-11-16' and '2018-12-15'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O','DIGITAL')
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+UNION
+
+select distinct
+spc1.pincode as origin_pincode,
+fso.sd_pincode as dest_pincode,
+
+spc1.sc_city as sc_city_origin,
+spc2.sc_city as sc_city_dest,
+
+spc1.sc_state as sc_state_origin,
+spc2.sc_state as sc_state_dest,
+
+
+spc1.sc_tier as sc_tier_origin,
+spc2.sc_tier as sc_tier_dest,
+
+spc1.city as city_origin,
+spc2.city as city_dest,
+
+spc2.zone as zone_dest,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group,
+cg.shipping_mode_code,
+'Nov 01- Dec 15' as 'period',
+3 as 'rank',
+
+sum(datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date))) as total_o2a,
+count(fso.suborder_Code) as total_suborders
+
+
+
+from dwh.f_suborders_oms fso 
+JOIN dwh.d_product_vendor dpv ON dpv.vendor_sid = fso.vendor_sid
+left join cocofs_dwh.fc_details fcd on UPPER(fcd.code) = UPPER(fso.sho_fp_code)
+left join cocofs_dwh.fc_address fca on fca.id = fcd.primary_address_id
+left JOIN analytics_logistics.score_postal_code spc1 ON spc1.pincode=IFNULL(fca.pincode,dpv.pin_code_contact_type_4)
+left JOIN analytics_logistics.score_postal_code spc2 ON spc2.pincode = fso.sd_pincode--DESTINATION
+
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+join fv1 on fv1.suborder_code = fso.suborder_code
+where date(fv1.first_attempt_date) between '2018-11-01' and '2018-12-15'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O','DIGITAL')
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+
+)
+;
+
+
+
+create local temp table m2 on commit preserve rows as
+(
+select distinct
+spc1.pincode as origin_pincode,
+fso.sd_pincode as dest_pincode,
+
+spc1.sc_city as sc_city_origin,
+spc2.sc_city as sc_city_dest,
+
+spc1.sc_state as sc_state_origin,
+spc2.sc_state as sc_state_dest,
+
+
+spc1.sc_tier as sc_tier_origin,
+spc2.sc_tier as sc_tier_dest,
+
+spc1.city as city_origin,
+spc2.city as city_dest,
+
+spc2.zone as zone_dest,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group,
+cg.shipping_mode_code,
+'OCT 17- Dec 15' as 'period',
+4 as 'rank',
+
+sum(datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date))) as total_o2a,
+count(fso.suborder_Code) as total_suborders
+
+
+
+from dwh.f_suborders_oms fso 
+JOIN dwh.d_product_vendor dpv ON dpv.vendor_sid = fso.vendor_sid
+left join cocofs_dwh.fc_details fcd on UPPER(fcd.code) = UPPER(fso.sho_fp_code)
+left join cocofs_dwh.fc_address fca on fca.id = fcd.primary_address_id
+left JOIN analytics_logistics.score_postal_code spc1 ON spc1.pincode=IFNULL(fca.pincode,dpv.pin_code_contact_type_4)
+left JOIN analytics_logistics.score_postal_code spc2 ON spc2.pincode = fso.sd_pincode--DESTINATION
+
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+join fv1 on fv1.suborder_code = fso.suborder_code
+where date(fv1.first_attempt_date) between '2018-10-17' and '2018-12-15'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O','DIGITAL')
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+
+UNION
+select distinct
+spc1.pincode as origin_pincode,
+fso.sd_pincode as dest_pincode,
+
+spc1.sc_city as sc_city_origin,
+spc2.sc_city as sc_city_dest,
+
+spc1.sc_state as sc_state_origin,
+spc2.sc_state as sc_state_dest,
+
+
+spc1.sc_tier as sc_tier_origin,
+spc2.sc_tier as sc_tier_dest,
+
+spc1.city as city_origin,
+spc2.city as city_dest,
+
+spc2.zone as zone_dest,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group,
+cg.shipping_mode_code,
+'OCT 02- Dec 15' as 'period',
+5 as 'rank',
+
+sum(datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date))) as total_o2a,
+count(fso.suborder_Code) as total_suborders
+
+
+
+from dwh.f_suborders_oms fso 
+JOIN dwh.d_product_vendor dpv ON dpv.vendor_sid = fso.vendor_sid
+left join cocofs_dwh.fc_details fcd on UPPER(fcd.code) = UPPER(fso.sho_fp_code)
+left join cocofs_dwh.fc_address fca on fca.id = fcd.primary_address_id
+left JOIN analytics_logistics.score_postal_code spc1 ON spc1.pincode=IFNULL(fca.pincode,dpv.pin_code_contact_type_4)
+left JOIN analytics_logistics.score_postal_code spc2 ON spc2.pincode = fso.sd_pincode--DESTINATION
+
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+join fv1 on fv1.suborder_code = fso.suborder_code
+where date(fv1.first_attempt_date) between '2018-10-02' and '2018-12-15'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O','DIGITAL')
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+UNION
+
+select distinct
+spc1.pincode as origin_pincode,
+fso.sd_pincode as dest_pincode,
+
+spc1.sc_city as sc_city_origin,
+spc2.sc_city as sc_city_dest,
+
+spc1.sc_state as sc_state_origin,
+spc2.sc_state as sc_state_dest,
+
+
+spc1.sc_tier as sc_tier_origin,
+spc2.sc_tier as sc_tier_dest,
+
+spc1.city as city_origin,
+spc2.city as city_dest,
+
+spc2.zone as zone_dest,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group,
+cg.shipping_mode_code,
+'sep 17- Dec 15' as 'period',
+6 as 'rank',
+
+sum(datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date))) as total_o2a,
+count(fso.suborder_Code) as total_suborders
+
+
+
+from dwh.f_suborders_oms fso 
+JOIN dwh.d_product_vendor dpv ON dpv.vendor_sid = fso.vendor_sid
+left join cocofs_dwh.fc_details fcd on UPPER(fcd.code) = UPPER(fso.sho_fp_code)
+left join cocofs_dwh.fc_address fca on fca.id = fcd.primary_address_id
+left JOIN analytics_logistics.score_postal_code spc1 ON spc1.pincode=IFNULL(fca.pincode,dpv.pin_code_contact_type_4)
+left JOIN analytics_logistics.score_postal_code spc2 ON spc2.pincode = fso.sd_pincode--DESTINATION
+
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+join fv1 on fv1.suborder_code = fso.suborder_code
+where date(fv1.first_attempt_date) between '2018-09-17' and '2018-12-15'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O','DIGITAL')
+group by 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+);
+
+drop table analytics_logistics.ay_o2a_bucket_16_31;
+create table analytics_logistics.ay_o2a_bucket_16_31 as
+(
+
+SELECT * from m1
+UNION
+SELECT * from m2
+)
+;
+
+
+
+--select datediff('dd','2018-09-17'::date,'2018-12-15'::date)
+
+
+drop table if exists a;
+create local temp table a on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.total_o2a) as 'total_o2a',
+sum(a.total_suborders) as 'total_suborders'
+
+from
+(
+select distinct
+shipping_mode_code,
+courier_group,
+origin_pincode,
+dest_pincode,
+min(rank) as 'Rank'
+from
+(select distinct
+shipping_mode_code,
+courier_group,
+origin_pincode,
+dest_pincode,
+rank,
+--min(rank) as 'rank',
+sum(total_o2a) as 'total_o2a',
+sum(total_suborders) as 'total_suborders'
+
+from analytics_logistics.ay_o2a_bucket_16_31 a
+GROUP BY 1,2,3,4,5
+having(sum(total_suborders))>=30
+) t1
+group by 1,2,3,4
+)t2
+
+JOIN analytics_logistics.ay_o2a_bucket_16_31 a ON a.origin_pincode=t2.origin_pincode and a.dest_pincode = t2.dest_pincode and a.courier_group = t2.courier_group and a.rank = t2.rank and a.shipping_mode_code = t2.shipping_mode_code
+
+group by 1,2,3,4,5
+)
+;
+
+
+
+
+
+
+drop table if exists a1;
+create local temp table a1 on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.total_o2a) as 'total_o2a',
+sum(a.total_suborders) as 'total_suborders'
+
+from
+(
+select distinct
+shipping_mode_code,
+courier_group,
+sc_city_origin,
+dest_pincode,
+min(rank) as 'Rank'
+from
+(select distinct
+shipping_mode_code,
+courier_group,
+sc_city_origin,
+dest_pincode,
+rank,
+--min(rank) as 'rank',
+sum(total_o2a) as 'total_o2a',
+sum(total_suborders) as 'total_suborders'
+
+from analytics_logistics.ay_o2a_bucket_16_31 a
+GROUP BY 1,2,3,4,5
+having(sum(total_suborders))>=30
+) t1
+group by 1,2,3,4
+)t2
+
+JOIN analytics_logistics.ay_o2a_bucket_16_31 a ON a.sc_city_origin=t2.sc_city_origin and a.dest_pincode = t2.dest_pincode and a.courier_group = t2.courier_group and a.rank = t2.rank and a.shipping_mode_code = t2.shipping_mode_code
+
+group by 1,2,3,4,5
+)
+;
+
+
+
+
+
+drop table if exists a2;
+create local temp table a2 on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.total_o2a) as 'total_o2a',
+sum(a.total_suborders) as 'total_suborders'
+
+from
+(
+select distinct
+shipping_mode_code,
+courier_group,
+sc_city_origin,
+city_dest,
+min(rank) as 'Rank'
+from
+(select distinct
+shipping_mode_code,
+courier_group,
+sc_city_origin,
+city_dest,
+rank,
+--min(rank) as 'rank',
+sum(total_o2a) as 'total_o2a',
+sum(total_suborders) as 'total_suborders'
+
+from analytics_logistics.ay_o2a_bucket_16_31 a
+GROUP BY 1,2,3,4,5
+having(sum(total_suborders))>=30
+) t1
+group by 1,2,3,4
+)t2
+
+JOIN analytics_logistics.ay_o2a_bucket_16_31 a ON a.sc_city_origin=t2.sc_city_origin and a.city_dest = t2.city_dest and a.courier_group = t2.courier_group and a.rank = t2.rank and a.shipping_mode_code = t2.shipping_mode_code
+
+group by 1,2,3,4,5
+)
+;
+
+
+
+
+
+
+drop table if exists a3;
+create local temp table a3 on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.total_o2a) as 'total_o2a',
+sum(a.total_suborders) as 'total_suborders'
+
+from
+(
+select distinct
+shipping_mode_code,
+courier_group,
+sc_city_origin,
+sc_city_dest,
+min(rank) as 'Rank'
+from
+(select distinct
+shipping_mode_code,
+courier_group,
+sc_city_origin,
+sc_city_dest,
+rank,
+--min(rank) as 'rank',
+sum(total_o2a) as 'total_o2a',
+sum(total_suborders) as 'total_suborders'
+
+from analytics_logistics.ay_o2a_bucket_16_31 a
+GROUP BY 1,2,3,4,5
+having(sum(total_suborders))>=30
+) t1
+group by 1,2,3,4
+)t2
+
+JOIN analytics_logistics.ay_o2a_bucket_16_31 a ON a.sc_city_origin=t2.sc_city_origin and a.sc_city_dest = t2.sc_city_dest and a.courier_group = t2.courier_group and a.rank = t2.rank and a.shipping_mode_code = t2.shipping_mode_code
+
+group by 1,2,3,4,5
+)
+;
+
+
+
+
+drop table if exists a4;
+create local temp table a4 on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.total_o2a) as 'total_o2a',
+sum(a.total_suborders) as 'total_suborders'
+
+from
+(
+select distinct
+shipping_mode_code,
+courier_group,
+sc_state_origin,
+sc_tier_origin,
+sc_city_dest,
+min(rank) as 'Rank'
+from
+(select distinct
+shipping_mode_code,
+courier_group,
+sc_state_origin,
+sc_tier_origin,
+sc_city_dest,
+rank,
+--min(rank) as 'rank',
+sum(total_o2a) as 'total_o2a',
+sum(total_suborders) as 'total_suborders'
+
+from analytics_logistics.ay_o2a_bucket_16_31 a
+GROUP BY 1,2,3,4,5,6
+having(sum(total_suborders))>=30
+) t1
+group by 1,2,3,4,5
+)t2
+
+JOIN analytics_logistics.ay_o2a_bucket_16_31 a ON a.sc_state_origin=t2.sc_state_origin and a.sc_tier_origin = t2.sc_tier_origin and a.sc_city_dest = t2.sc_city_dest and a.courier_group = t2.courier_group and a.rank = t2.rank and a.shipping_mode_code = t2.shipping_mode_code
+
+group by 1,2,3,4,5,6
+)
+;
+
+
+
+
+
+drop table if exists a5;
+create local temp table a5 on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.total_o2a) as 'total_o2a',
+sum(a.total_suborders) as 'total_suborders'
+
+from
+(
+select distinct
+shipping_mode_code,
+courier_group,
+sc_city_origin,
+sc_tier_dest,
+sc_state_dest,
+min(rank) as 'Rank'
+from
+(select distinct
+shipping_mode_code,
+courier_group,
+sc_city_origin,
+sc_tier_dest,
+sc_state_dest,
+rank,
+--min(rank) as 'rank',
+sum(total_o2a) as 'total_o2a',
+sum(total_suborders) as 'total_suborders'
+
+from analytics_logistics.ay_o2a_bucket_16_31 a
+GROUP BY 1,2,3,4,5,6
+having(sum(total_suborders))>=30
+) t1
+group by 1,2,3,4,5
+)t2
+
+JOIN analytics_logistics.ay_o2a_bucket_16_31 a ON a.sc_city_origin=t2.sc_city_origin and a.sc_tier_dest = t2.sc_tier_dest and a.sc_state_dest = t2.sc_state_dest and a.courier_group = t2.courier_group and a.rank = t2.rank and a.shipping_mode_code = t2.shipping_mode_code
+
+group by 1,2,3,4,5,6
+)
+;
+
+
+
+
+
+drop table if exists a6;
+create local temp table a6 on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.total_o2a) as 'total_o2a',
+sum(a.total_suborders) as 'total_suborders'
+
+from
+(
+select distinct
+shipping_mode_code,
+courier_group,
+sc_state_origin,
+sc_tier_origin,
+sc_state_dest,
+sc_tier_dest,
+min(rank) as 'Rank'
+from
+(select distinct
+shipping_mode_code,
+courier_group,
+sc_state_origin,
+sc_tier_origin,
+sc_state_dest,
+sc_tier_dest,
+rank,
+--min(rank) as 'rank',
+sum(total_o2a) as 'total_o2a',
+sum(total_suborders) as 'total_suborders'
+
+from analytics_logistics.ay_o2a_bucket_16_31 a
+GROUP BY 1,2,3,4,5,6,7
+having(sum(total_suborders))>=30
+) t1
+group by 1,2,3,4,5,6
+)t2
+
+JOIN analytics_logistics.ay_o2a_bucket_16_31 a ON a.sc_state_origin=t2.sc_state_origin and a.sc_tier_origin = t2.sc_tier_origin
+and a.sc_state_dest = t2.sc_state_dest and a.sc_tier_dest = t2.sc_tier_dest and a.courier_group = t2.courier_group and a.rank = t2.rank and a.shipping_mode_code = t2.shipping_mode_code
+
+group by 1,2,3,4,5,6,7
+)
+;
+
+
+
+
+
+drop table if exists a7;
+create local temp table a7 on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.total_o2a) as 'total_o2a',
+sum(a.total_suborders) as 'total_suborders'
+
+from
+(
+select distinct
+shipping_mode_code,
+courier_group,
+sc_state_origin,
+zone_dest,
+min(rank) as 'Rank'
+from
+(select distinct
+shipping_mode_code,
+courier_group,
+sc_state_origin,
+zone_dest,
+rank,
+--min(rank) as 'rank',
+sum(total_o2a) as 'total_o2a',
+sum(total_suborders) as 'total_suborders'
+
+from analytics_logistics.ay_o2a_bucket_16_31 a
+GROUP BY 1,2,3,4,5
+having(sum(total_suborders))>=30
+) t1
+group by 1,2,3,4
+)t2
+
+JOIN analytics_logistics.ay_o2a_bucket_16_31 a ON a.sc_state_origin=t2.sc_state_origin and a.zone_dest = t2.zone_dest and a.courier_group = t2.courier_group and a.rank = t2.rank and a.shipping_mode_code = t2.shipping_mode_code
+
+group by 1,2,3,4,5
+)
+;
+
+--select * from ays order by 1 limit 100;
+--SELECT * FROM analytics_logistics.ay_o2a 
+
+--select * from a5 where courier_group = 'BLUEDART' and shipping_mode_code = 'Air' limit 100;
+
+drop table ays;
+create local temp table ays on commit preserve rows as
+(
+
+select distinct
+n.suborder_code,
+n.serv_courier_group,
+n.shipping_mode,
+n.suborders1/n.rank1 as 'shipped1',
+n.O2A1,
+n.suborders2/n.rank2 as 'shipped2',
+n.O2A2,
+n.suborders3/n.rank3 as 'shipped3',
+n.O2A3,
+n.suborders4/n.rank4 as 'shipped4',
+n.O2A4,
+n.suborders5/n.rank5 as 'shipped5',
+n.O2A5,
+n.suborders6/n.rank6 as 'shipped6',
+n.O2A6,
+n.suborders7/n.rank7 as 'shipped7',
+n.O2A7,
+n.suborders8/n.rank8 as 'shipped8',
+n.O2A8
+
+from
+(SELECT distinct
+t.suborder_code,
+t.serv_courier_group,
+t.shipping_mode,
+
+a.total_suborders as 'suborders1',
+a.total_o2a/a.total_suborders as 'O2A1',
+
+case when a.rank =1 then 15 
+     when a.rank =2 then 30
+     when a.rank =3 then 45
+     when a.rank =4 then 60
+     when a.rank =5 then 75
+     when a.rank =6 then 90
+end as 'rank1' ,
+
+--a.rank as 'rank1',
+
+a1.total_suborders as 'suborders2',
+a1.total_o2a/a1.total_suborders as 'O2A2',
+case when a1.rank =1 then 15 
+     when a1.rank =2 then 30
+     when a1.rank =3 then 45
+     when a1.rank =4 then 60
+     when a1.rank =5 then 75
+     when a1.rank =6 then 90
+end as 'rank2' ,
+
+a2.total_suborders as 'suborders3',
+a2.total_o2a/a2.total_suborders as 'O2A3',
+case when a2.rank =1 then 15 
+     when a2.rank =2 then 30
+     when a2.rank =3 then 45
+     when a2.rank =4 then 60
+     when a2.rank =5 then 75
+     when a2.rank =6 then 90
+end as 'rank3',
+a3.total_suborders as 'suborders4',
+a3.total_o2a/a3.total_suborders as 'O2A4',
+case when a3.rank =1 then 15 
+     when a3.rank =2 then 30
+     when a3.rank =3 then 45
+     when a3.rank =4 then 60
+     when a3.rank =5 then 75
+     when a3.rank =6 then 90
+end as 'rank4',
+
+
+a4.total_suborders as 'suborders5',
+a4.total_o2a/a4.total_suborders as 'O2A5',
+case when a4.rank =1 then 15 
+     when a4.rank =2 then 30
+     when a4.rank =3 then 45
+     when a4.rank =4 then 60
+     when a4.rank =5 then 75
+     when a4.rank =6 then 90
+end as 'rank5',
+a5.total_suborders as 'suborders6',
+a5.total_o2a/a5.total_suborders as 'O2A6',
+case when a5.rank =1 then 15 
+     when a5.rank =2 then 30
+     when a5.rank =3 then 45
+     when a5.rank =4 then 60
+     when a5.rank =5 then 75
+     when a5.rank =6 then 90
+end as 'rank6',
+a6.total_suborders as 'suborders7',
+a6.total_o2a/a6.total_suborders as 'O2A7',
+case when a6.rank =1 then 15 
+     when a6.rank =2 then 30
+     when a6.rank =3 then 45
+     when a6.rank =4 then 60
+     when a6.rank =5 then 75
+     when a6.rank =6 then 90
+end as 'rank7',
+a7.total_suborders as 'suborders8',
+a7.total_o2a/a7.total_suborders as 'O2A8',
+case when a7.rank =1 then 15 
+     when a7.rank =2 then 30
+     when a7.rank =3 then 45
+     when a7.rank =4 then 60
+     when a7.rank =5 then 75
+     when a7.rank =6 then 90
+end as 'rank8'
+
+FROM analytics_logistics.final_rate_card1_16_31 t
+LEFT join a on a.origin_pincode = t.origin_pincode and a.dest_pincode = t.dest_pincode and a.courier_group = t.serv_courier_group and a.shipping_mode_code =t.shipping_mode
+LEFT join a1 on a1.sc_city_origin = t.origin_sc_city and a1.dest_pincode = t.dest_pincode and a1.courier_group = t.serv_courier_group and a1.shipping_mode_code =t.shipping_mode
+LEFT join a2 on a2.sc_city_origin = t.origin_sc_city and a2.city_dest = t.dest_city and a2.courier_group = t.serv_courier_group and a2.shipping_mode_code =t.shipping_mode
+LEFT join a3 on a3.sc_city_origin = t.origin_sc_city and a3.sc_city_dest = t.dest_sc_city and a3.courier_group = t.serv_courier_group and a3.shipping_mode_code =t.shipping_mode
+LEFT join a4 on a4.sc_state_origin = t.origin_sc_state and a4.sc_tier_origin = t.origin_sc_tier and a4.sc_city_dest = t.dest_sc_city and a4.courier_group = t.serv_courier_group and a4.shipping_mode_code =t.shipping_mode
+LEFT join a5 on a5.sc_city_origin = t.origin_sc_city and a5.sc_tier_dest = t.dest_sc_tier and a5.sc_state_dest = t.dest_sc_state and a5.courier_group = t.serv_courier_group and a5.shipping_mode_code =t.shipping_mode
+LEFT join a6 on a6.sc_state_origin = t.origin_sc_state and a6.sc_tier_origin = t.origin_sc_tier and a6.sc_state_dest = t.dest_sc_state and a6.sc_tier_dest = t.dest_sc_tier and a6.courier_group = t.serv_courier_group and a6.shipping_mode_code =t.shipping_mode
+LEFT join a7 on a7.sc_state_origin = t.origin_state and a7.zone_dest = t.dest_zone and a7.courier_group = t.serv_courier_group and a7.shipping_mode_code =t.shipping_mode
+)n
+
+)
+;
+
+
+
+
+
+drop table analytics_logistics.ayu_sample_o2a_data_16_31;
+create  table analytics_logistics.ayu_sample_o2a_data_16_31  as
+(
+select 
+t.*,
+case when shipped1 is not null then 1
+     when shipped2 is not null then 2
+     when shipped3 is not null then 3
+     when shipped4 is not null then 4
+     when shipped5 is not null then 5
+     when shipped6 is not null then 6
+     when shipped7 is not null then 7
+     when shipped8 is not null then 8 else null end as 'Level'
+
+    
+from ays t
+);
+
+
+
+drop table if exists tn;
+create local temp table tn on commit preserve rows as
+(select 
+suborder_code,
+min(level) as 'level'
+FROM analytics_logistics.ayu_sample_o2a_data_16_31
+group by 1
+) 
+;
+
+drop table analytics_logistics.ayu_sample_o2a_data1_16_31;
+create table analytics_logistics.ayu_sample_o2a_data1_16_31 as
+(
+select 
+t.*,
+tn.level as 'final_level',
+null::float as 'L1',
+null::float as 'L2',
+null::float as 'L3',
+null::float as 'L4',
+null::float as 'L5',
+null::float as 'L6',
+null::float as 'L7',
+null::float as 'L8'
+
+
+FROM analytics_logistics.ayu_sample_o2a_data_16_31 t
+left join tn on tn.suborder_code = t.suborder_code
+)
+;
+
+
+
+
+
+
+
+
+
+update analytics_logistics.ayu_sample_o2a_data1_16_31 a
+set L1 = ts.value,
+L2 = ts.value2,
+L3 = ts.value3,
+L4 = ts.value4,
+L5 = ts.value5,
+L6 = ts.value6,
+L7 = ts.value7,
+L8 = ts.value8
+
+from (
+select
+suborder_code,
+sum(shipped1*o2a1)/sum(shipped1) as 'value',
+sum(shipped1*o2a2)/sum(shipped1) as 'value2',
+sum(shipped1*o2a3)/sum(shipped1) as 'value3',
+sum(shipped1*o2a4)/sum(shipped1) as 'value4',
+sum(shipped1*o2a5)/sum(shipped1) as 'value5',
+sum(shipped1*o2a6)/sum(shipped1) as 'value6',
+sum(shipped1*o2a7)/sum(shipped1) as 'value7',
+sum(shipped1*o2a8)/sum(shipped1) as 'value8'
+
+from analytics_logistics.ayu_sample_o2a_data1_16_31
+where  Level = final_level and level =1
+group by 1
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(shipped2*o2a2)/sum(shipped2) as 'value2',
+sum(shipped2*o2a3)/sum(shipped2) as 'value3',
+sum(shipped2*o2a4)/sum(shipped2) as 'value4',
+sum(shipped2*o2a5)/sum(shipped2) as 'value5',
+sum(shipped2*o2a6)/sum(shipped2) as 'value6',
+sum(shipped2*o2a7)/sum(shipped2) as 'value7',
+sum(shipped2*o2a8)/sum(shipped2) as 'value8'
+
+from analytics_logistics.ayu_sample_o2a_data1_16_31
+where  Level = final_level and level =2
+group by 1
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(shipped3*o2a3)/sum(shipped3) as 'value3',
+sum(shipped3*o2a4)/sum(shipped3) as 'value4',
+sum(shipped3*o2a5)/sum(shipped3) as 'value5',
+sum(shipped3*o2a6)/sum(shipped3) as 'value6',
+sum(shipped3*o2a7)/sum(shipped3) as 'value7',
+sum(shipped3*o2a8)/sum(shipped3) as 'value8'
+
+from analytics_logistics.ayu_sample_o2a_data1_16_31
+where  Level = final_level and level =3
+group by 1
+
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(null::float) as 'value3',
+sum(shipped4*o2a4)/sum(shipped4) as 'value4',
+sum(shipped4*o2a5)/sum(shipped4) as 'value5',
+sum(shipped4*o2a6)/sum(shipped4) as 'value6',
+sum(shipped4*o2a7)/sum(shipped4) as 'value7',
+sum(shipped4*o2a8)/sum(shipped4) as 'value8'
+
+from analytics_logistics.ayu_sample_o2a_data1_16_31
+where  Level = final_level and level =4
+group by 1
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(null::float) as 'value3',
+sum(null::float) as 'value4',
+sum(shipped5*o2a5)/sum(shipped5) as 'value5',
+sum(shipped5*o2a6)/sum(shipped5) as 'value6',
+sum(shipped5*o2a7)/sum(shipped5) as 'value7',
+sum(shipped5*o2a8)/sum(shipped5) as 'value8'
+
+from analytics_logistics.ayu_sample_o2a_data1_16_31
+where  Level = final_level and level =5
+group by 1
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(null::float) as 'value3',
+sum(null::float) as 'value4',
+sum(null::float) as 'value5',
+sum(shipped6*o2a6)/sum(shipped6) as 'value6',
+sum(shipped6*o2a7)/sum(shipped6) as 'value7',
+sum(shipped6*o2a8)/sum(shipped6) as 'value8'
+
+from analytics_logistics.ayu_sample_o2a_data1_16_31
+where  Level = final_level and level =6
+group by 1
+UNION
+
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(null::float) as 'value3',
+sum(null::float) as 'value4',
+sum(null::float) as 'value5',
+sum(null::float) as 'value6',
+sum(shipped7*o2a7)/sum(shipped7) as 'value7',
+sum(shipped7*o2a8)/sum(shipped7) as 'value8'
+
+from analytics_logistics.ayu_sample_o2a_data1_16_31
+where  Level = final_level and level =7
+group by 1
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(null::float) as 'value3',
+sum(null::float) as 'value4',
+sum(null::float) as 'value5',
+sum(null::float) as 'value6',
+sum(null::float) as 'value7',
+sum(shipped8*o2a8)/sum(shipped8) as 'value8'
+
+from analytics_logistics.ayu_sample_o2a_data1_16_31
+where  Level = final_level and level =8
+group by 1
+) ts
+where ts.suborder_code = a.suborder_code
+;
+
+
+
+drop table analytics_logistics.ayu_sample_o2a_data2_16_31;
+create table analytics_logistics.ayu_sample_o2a_data2_16_31 as
+(
+SELECT 
+a.*,
+CAse when final_level=1 and level = 1 then o2a1
+     when final_level=1 and level = 2 then o2a2*L1/L2
+     when final_level=1 and level = 3 then o2a3*L1/L3
+     when final_level=1 and level = 4 then o2a4*L1/L4
+     when final_level=1 and level = 5 then o2a5*L1/L5
+     when final_level=1 and level = 6 then o2a6*L1/L6
+     when final_level=1 and level = 7 then o2a7*L1/L7
+     when final_level=1 and level = 8 then o2a8*L1/L8
+     
+     when final_level=2 and level = 2 then o2a2
+     when final_level=2 and level = 3 then o2a3*l2/l3
+     when final_level=2 and level = 4 then o2a4*l2/l4
+     when final_level=2 and level = 5 then o2a5*l2/l5
+     when final_level=2 and level = 6 then o2a6*l2/l6
+     when final_level=2 and level = 7 then o2a7*l2/l7
+     when final_level=2 and level = 8 then o2a8*l2/l8
+     
+     when final_level=3 and level = 3 then o2a3
+     when final_level=3 and level = 4 then o2a4*l3/l4
+     when final_level=3 and level = 5 then o2a5*l3/l5
+     when final_level=3 and level = 6 then o2a6*l3/l6
+     when final_level=3 and level = 7 then o2a7*l3/l7
+     when final_level=3 and level = 8 then o2a8*l3/l8
+     
+     when final_level=4 and level = 4 then o2a4
+     when final_level=4 and level = 5 then o2a5*l4/l5
+     when final_level=4 and level = 6 then o2a6*l4/l6
+     when final_level=4 and level = 7 then o2a7*l4/l7
+     when final_level=4 and level = 8 then o2a8*l4/l8
+     
+     when final_level=5 and level = 5 then o2a5
+     when final_level=5 and level = 6 then o2a6*l5/l6
+     when final_level=5 and level = 7 then o2a7*l5/l7
+     when final_level=5 and level = 8 then o2a8*l5/l8
+
+     when final_level=6 and level = 6 then o2a6
+     when final_level=6 and level = 7 then o2a7*l6/l7
+     when final_level=6 and level = 8 then o2a8*l6/l8
+
+     when final_level=7 and level = 7 then o2a7
+     when final_level=7 and level = 8 then o2a8*l7/l8
+
+     when final_level=8 and level = 8 then o2a8 end as 'final'
+
+from analytics_logistics.ayu_sample_o2a_data1_16_31 a
+order by 1
+)
+;
+
+
+
+
+
+
+
+
+
+
+
+-------------------RTO predict 16_31---------------------------
+
+
+
+CREATE LOCAL TEMP TABLE fv1 ON COMMIT PRESERVE ROWS AS
+(SELECT  DISTINCT
+fso.suborder_code,
+MIN(tph.status_date) AS 'first_attempt_date'
+FROM dwh.f_suborders_oms fso
+join oms.suborder sub on fso.suborder_code = sub.code
+JOIN dwh.f_shipping_package fsp ON fsp.sp_shipping_package_id = fso.soi_shipping_package_id
+JOIN shiptrack_dwh.tracking_package tp ON tp.reference_code = fsp.sp_reference_code AND tp.tracking_type NOT IN ('RMS','RMS_RTV')
+JOIN shiptrack_dwh.tracking_package_history tph ON tph.tracking_package_id = tp.id AND tph.new_status IN ('DEL','UDL','RTI','RTC','R-IN','R-ITR','R-OFD','R-OUT','RUD')
+where  to_date(fso.subo_date_created::varchar,'YYYYMMDD')  between current_date - 200 and current_date -1
+GROUP BY 1
+);
+
+drop table if exists m;
+create local temp table m on commit preserve rows as
+(
+select distinct
+fso.subo_shipping_method_code as 'Payment_mode',
+cg.shipping_mode_code as 'shipping_mode',
+spc.pincode,
+spc.city,
+spc.state,
+spc.tier,
+spc.zone,
+spc.sc_city,
+spc.sc_state,
+spc.sc_tier,
+cg.code as 'courier_code',
+cg.courier_group,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group1,
+'Nov 16- Nov 30' as 'period',
+1 as 'rank',
+case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 0 and 3 then '0_to_3'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 4 and 6 then '4_to_6'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 7 and 9 then '7_to_9'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 10 and 12 then '10_to_12'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) >12 then '>12'
+else '>12' end as 'O2A_Bucket',
+
+
+--datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) as 'O2A',
+count(distinct fso.suborder_code) as 'Shipped_orders',
+count(distinct case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),to_date(fsp.sph_date_delivered::varchar,'YYYYMMDD'))<=14 then fso.suborder_code end) as 'DEL_14_days',
+count(distinct case when fsp.sph_date_delivered is not null then fso.suborder_code end) as 'Total_Delivered',
+count(distinct case when ifnull(fsp.sph_date_return,fso.soih_date_return_accepted) is not null and fsp.sph_date_delivered is null then fso.suborder_code end) as 'rto_orders'
+
+
+FROM dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join fv1 on fv1.suborder_code = fso.suborder_code
+where to_date(fso.subo_date_verified::varchar,'YYYYMMDD') between '2018-11-16' and '2018-11-30'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O')
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+UNION
+
+select distinct
+fso.subo_shipping_method_code as 'Payment_mode',
+cg.shipping_mode_code as 'shipping_mode',
+spc.pincode,
+spc.city,
+spc.state,
+spc.tier,
+spc.zone,
+spc.sc_city,
+spc.sc_state,
+spc.sc_tier,
+cg.code as 'courier_code',
+cg.courier_group,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group1,
+'Nov 1- Nov 30' as 'period',
+2 as 'rank',
+case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 0 and 3 then '0_to_3'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 4 and 6 then '4_to_6'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 7 and 9 then '7_to_9'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 10 and 12 then '10_to_12'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) >12 then '>12'
+else '>12' end as 'O2A_Bucket',
+
+
+--datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) as 'O2A',
+count(distinct fso.suborder_code) as 'Shipped_orders',
+count(distinct case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),to_date(fsp.sph_date_delivered::varchar,'YYYYMMDD'))<=14 then fso.suborder_code end) as 'DEL_14_days',
+count(distinct case when fsp.sph_date_delivered is not null then fso.suborder_code end) as 'Total_Delivered',
+count(distinct case when ifnull(fsp.sph_date_return,fso.soih_date_return_accepted) is not null and fsp.sph_date_delivered is null then fso.suborder_code end) as 'rto_orders'
+
+
+FROM dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join fv1 on fv1.suborder_code = fso.suborder_code
+where to_date(fso.subo_date_verified::varchar,'YYYYMMDD') between '2018-11-01' and '2018-11-30'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O')
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+UNION
+
+select distinct
+fso.subo_shipping_method_code as 'Payment_mode',
+cg.shipping_mode_code as 'shipping_mode',
+spc.pincode,
+spc.city,
+spc.state,
+spc.tier,
+spc.zone,
+spc.sc_city,
+spc.sc_state,
+spc.sc_tier,
+cg.code as 'courier_code',
+cg.courier_group,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group1,
+'OCT 17- Nov 30' as 'period',
+3 as 'rank',
+case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 0 and 3 then '0_to_3'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 4 and 6 then '4_to_6'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 7 and 9 then '7_to_9'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 10 and 12 then '10_to_12'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) >12 then '>12'
+else '>12' end as 'O2A_Bucket',
+
+
+--datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) as 'O2A',
+count(distinct fso.suborder_code) as 'Shipped_orders',
+count(distinct case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),to_date(fsp.sph_date_delivered::varchar,'YYYYMMDD'))<=14 then fso.suborder_code end) as 'DEL_14_days',
+count(distinct case when fsp.sph_date_delivered is not null then fso.suborder_code end) as 'Total_Delivered',
+count(distinct case when ifnull(fsp.sph_date_return,fso.soih_date_return_accepted) is not null and fsp.sph_date_delivered is null then fso.suborder_code end) as 'rto_orders'
+
+
+FROM dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join fv1 on fv1.suborder_code = fso.suborder_code
+where to_date(fso.subo_date_verified::varchar,'YYYYMMDD') between '2018-10-17' and '2018-11-30'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O')
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+
+);
+
+
+
+
+
+
+drop table if exists m1;
+create locAL TEMP TABLE m1 on commit preserve rows as
+(
+
+
+select distinct
+fso.subo_shipping_method_code as 'Payment_mode',
+cg.shipping_mode_code as 'shipping_mode',
+spc.pincode,
+spc.city,
+spc.state,
+spc.tier,
+spc.zone,
+spc.sc_city,
+spc.sc_state,
+spc.sc_tier,
+cg.code as 'courier_code',
+cg.courier_group,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group1,
+'oct 2- Nov 30' as 'period',
+4 as 'rank',
+case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 0 and 3 then '0_to_3'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 4 and 6 then '4_to_6'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 7 and 9 then '7_to_9'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 10 and 12 then '10_to_12'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) >12 then '>12'
+else '>12' end as 'O2A_Bucket',
+
+
+--datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) as 'O2A',
+count(distinct fso.suborder_code) as 'Shipped_orders',
+count(distinct case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),to_date(fsp.sph_date_delivered::varchar,'YYYYMMDD'))<=14 then fso.suborder_code end) as 'DEL_14_days',
+count(distinct case when fsp.sph_date_delivered is not null then fso.suborder_code end) as 'Total_Delivered',
+count(distinct case when ifnull(fsp.sph_date_return,fso.soih_date_return_accepted) is not null and fsp.sph_date_delivered is null then fso.suborder_code end) as 'rto_orders'
+
+
+FROM dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join fv1 on fv1.suborder_code = fso.suborder_code
+where to_date(fso.subo_date_verified::varchar,'YYYYMMDD') between '2018-10-02' and '2018-11-30'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O')
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+
+UNION
+
+select distinct
+fso.subo_shipping_method_code as 'Payment_mode',
+cg.shipping_mode_code as 'shipping_mode',
+spc.pincode,
+spc.city,
+spc.state,
+spc.tier,
+spc.zone,
+spc.sc_city,
+spc.sc_state,
+spc.sc_tier,
+cg.code as 'courier_code',
+cg.courier_group,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group1,
+'sep 17- Nov 30' as 'period',
+5 as 'rank',
+case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 0 and 3 then '0_to_3'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 4 and 6 then '4_to_6'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 7 and 9 then '7_to_9'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 10 and 12 then '10_to_12'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) >12 then '>12'
+else '>12' end as 'O2A_Bucket',
+
+
+--datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) as 'O2A',
+count(distinct fso.suborder_code) as 'Shipped_orders',
+count(distinct case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),to_date(fsp.sph_date_delivered::varchar,'YYYYMMDD'))<=14 then fso.suborder_code end) as 'DEL_14_days',
+count(distinct case when fsp.sph_date_delivered is not null then fso.suborder_code end) as 'Total_Delivered',
+count(distinct case when ifnull(fsp.sph_date_return,fso.soih_date_return_accepted) is not null and fsp.sph_date_delivered is null then fso.suborder_code end) as 'rto_orders'
+
+
+FROM dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join fv1 on fv1.suborder_code = fso.suborder_code
+where to_date(fso.subo_date_verified::varchar,'YYYYMMDD') between '2018-09-17' and '2018-11-30'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O')
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+
+UNION
+
+select distinct
+fso.subo_shipping_method_code as 'Payment_mode',
+cg.shipping_mode_code as 'shipping_mode',
+spc.pincode,
+spc.city,
+spc.state,
+spc.tier,
+spc.zone,
+spc.sc_city,
+spc.sc_state,
+spc.sc_tier,
+cg.code as 'courier_code',
+cg.courier_group,
+
+case when cg.code in ('XPRESSBEES_AIR_SFC','XPRESSBEES_DS_SFC') then 'XPRESSBEES_SFC'
+WHEN courier_group='XPRESSBEES' then 'XPRESSBEES_NON_SFC'
+when cg.code ='BD_ETAIL' then 'BD_ETAIL'
+when courier_group='BLUEDART' THEN 'BLUEDART'
+when courier_group in ('VULCAN','ECOMM_EXP','SHADOWFAX','DELHIVERY') then courier_group else courier_group
+end as courier_group1,
+'sep 02- Nov 30' as 'period',
+6 as 'rank',
+case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 0 and 3 then '0_to_3'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 4 and 6 then '4_to_6'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 7 and 9 then '7_to_9'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) between 10 and 12 then '10_to_12'
+     when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) >12 then '>12'
+else '>12' end as 'O2A_Bucket',
+
+
+--datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),date(fv1.first_attempt_date)) as 'O2A',
+count(distinct fso.suborder_code) as 'Shipped_orders',
+count(distinct case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),to_date(fsp.sph_date_delivered::varchar,'YYYYMMDD'))<=14 then fso.suborder_code end) as 'DEL_14_days',
+count(distinct case when fsp.sph_date_delivered is not null then fso.suborder_code end) as 'Total_Delivered',
+count(distinct case when ifnull(fsp.sph_date_return,fso.soih_date_return_accepted) is not null and fsp.sph_date_delivered is null then fso.suborder_code end) as 'rto_orders'
+
+
+FROM dwh.f_suborders_oms fso
+join dwh.d_product dp on dp.product_sid = fso.product_sid
+join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+join analytics_logistics.score_postal_code spc on spc.pincode = fso.sd_pincode
+join analytics_logistics.courier_group cg on cg.shipping_provider_sid = fsp.shipping_provider_sid and cg.transit_type_code = 'Forward'
+left join fv1 on fv1.suborder_code = fso.suborder_code
+where to_date(fso.subo_date_verified::varchar,'YYYYMMDD') between '2018-09-02' and '2018-11-30'
+and fsp.sph_date_shipped is not null
+and fso.sho_fulfillment_type NOT IN ('VENDOR_SELF','O2O')
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+
+);
+
+
+
+drop table analytics_logistics.ay_rto12_bucket1_16_31;
+create table analytics_logistics.ay_rto12_bucket1_16_31 as
+(
+SELECT * FROM m
+union 
+select * from m1
+)
+;
+
+
+
+
+
+-------------------pincode_o2a-----------------
+
+
+
+drop table if exists a;
+create local temp table a on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.Shipped_orders) as 'Shipped_orders',
+sum(a.DEL_14_days) as 'DEL_14_days'
+
+from
+(
+select distinct
+Payment_mode,
+shipping_mode,
+pincode,
+o2a_bucket,
+courier_group1,
+min(rank) as 'Rank'
+from
+(select distinct
+Payment_mode,
+shipping_mode,
+pincode,
+o2a_bucket,
+courier_group1,
+rank,
+--min(rank) as 'rank',
+sum(Shipped_orders) as 'Shipped_orders',
+sum(DEL_14_days) as 'DEL_14_days'
+
+from analytics_logistics.ay_rto12_bucket1_16_31 a
+GROUP BY 1,2,3,4,5,6
+having(sum(Shipped_orders))>=30
+) t1
+group by 1,2,3,4,5
+)t2
+
+JOIN analytics_logistics.ay_rto12_bucket1_16_31 a ON a.pincode=t2.pincode and a.o2a_bucket = t2.o2a_bucket and a.courier_group1 = t2.courier_group1 and a.rank = t2.rank
+and a.shipping_mode = t2.shipping_mode and a.Payment_mode = t2.Payment_mode
+
+group by 1,2,3,4,5,6
+)
+;
+----------only pincode----------
+drop table if exists a1;
+create local temp table a1 on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.Shipped_orders) as 'Shipped_orders',
+sum(a.DEL_14_days) as 'DEL_14_days'
+
+from
+(
+select distinct
+Payment_mode,
+shipping_mode,
+pincode,
+--o2a_bucket,
+courier_group1,
+min(rank) as 'Rank'
+from
+(select distinct
+Payment_mode,
+shipping_mode,
+pincode,
+--o2a_bucket,
+courier_group1,
+rank,
+--min(rank) as 'rank',
+sum(Shipped_orders) as 'Shipped_orders',
+sum(DEL_14_days) as 'DEL_14_days'
+
+from analytics_logistics.ay_rto12_bucket1_16_31 a
+GROUP BY 1,2,3,4,5
+having(sum(Shipped_orders))>=30
+) t1
+group by 1,2,3,4
+)t2
+
+JOIN analytics_logistics.ay_rto12_bucket1_16_31 a ON a.pincode=t2.pincode  and a.courier_group1 = t2.courier_group1 and a.rank = t2.rank
+and a.shipping_mode = t2.shipping_mode and a.Payment_mode = t2.Payment_mode
+
+group by 1,2,3,4,5
+)
+;
+
+
+---------------------city_o2a-----------
+drop table if exists a2;
+create local temp table a2 on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.Shipped_orders) as 'Shipped_orders',
+sum(a.DEL_14_days) as 'DEL_14_days'
+
+from
+(
+select distinct
+Payment_mode,
+shipping_mode,
+city,
+o2a_bucket,
+courier_group1,
+min(rank) as 'Rank'
+from
+(select distinct
+Payment_mode,
+shipping_mode,
+city,
+o2a_bucket,
+courier_group1,
+rank,
+--min(rank) as 'rank',
+sum(Shipped_orders) as 'Shipped_orders',
+sum(DEL_14_days) as 'DEL_14_days'
+
+from analytics_logistics.ay_rto12_bucket1_16_31 a
+GROUP BY 1,2,3,4,5,6
+having(sum(Shipped_orders))>=30
+) t1
+group by 1,2,3,4,5
+)t2
+
+JOIN analytics_logistics.ay_rto12_bucket1_16_31 a ON a.city=t2.city and a.o2a_bucket = t2.o2a_bucket and a.courier_group1 = t2.courier_group1 and a.rank = t2.rank
+and a.shipping_mode = t2.shipping_mode and a.Payment_mode = t2.Payment_mode
+
+group by 1,2,3,4,5,6
+)
+;
+-------------------only_city----------------
+
+drop table if exists a3;
+create local temp table a3 on commit preserve rows as
+(
+select distinct t2.*,
+sum(a.Shipped_orders) as 'Shipped_orders',
+sum(a.DEL_14_days) as 'DEL_14_days'
+
+from
+(
+select distinct
+Payment_mode,
+shipping_mode,
+city,
+--o2a_bucket,
+courier_group1,
+min(rank) as 'Rank'
+from
+(select distinct
+Payment_mode,
+shipping_mode,
+city,
+--o2a_bucket,
+courier_group1,
+rank,
+--min(rank) as 'rank',
+sum(Shipped_orders) as 'Shipped_orders',
+sum(DEL_14_days) as 'DEL_14_days'
+
+from analytics_logistics.ay_rto12_bucket1_16_31 a
+GROUP BY 1,2,3,4,5
+having(sum(Shipped_orders))>=30
+) t1
+group by 1,2,3,4
+)t2
+
+JOIN analytics_logistics.ay_rto12_bucket1_16_31 a ON a.city=t2.city  and a.courier_group1 = t2.courier_group1 and a.rank = t2.rank
+and a.shipping_mode = t2.shipping_mode and a.Payment_mode = t2.Payment_mode
+
+group by 1,2,3,4,5
+)
+;
+------------------------------state_tier_o2a_bucket----------------------
+
+drop table if exists a4;
+create local temp table a4 on commit preserve rows as
+(select 
+t2.*,
+sum(a.Shipped_orders) as 'Shipped_orders',
+sum(a.DEL_14_days) as 'DEL_14_days'
+from
+(
+select distinct
+Payment_mode,
+shipping_mode,
+state,
+tier,
+o2a_bucket,
+courier_group1,
+min(rank) as 'Rank'
+from
+(select distinct
+Payment_mode,
+shipping_mode,
+state,
+tier,
+o2a_bucket,
+courier_group1,
+rank,
+--min(rank) as 'rank',
+sum(Shipped_orders) as 'Shipped_orders',
+sum(DEL_14_days) as 'DEL_14_days'
+
+from analytics_logistics.ay_rto12_bucket1_16_31 a
+GROUP BY 1,2,3,4,5,6,7
+having(sum(Shipped_orders))>=30
+) t1
+
+group by 1,2,3,4,5,6
+) t2
+
+JOIN analytics_logistics.ay_rto12_bucket1_16_31 a ON a.state = t2.state and a.tier = t2.tier and a.courier_group1 = t2.courier_group1 and a.rank = t2.rank
+and a.shipping_mode = t2.shipping_mode and a.Payment_mode = t2.Payment_mode and a.o2a_bucket= t2.o2a_bucket
+
+group by 1,2,3,4,5,6,7
+)
+;
+
+---------------------state_tier---------------
+drop table if exists a5;
+create local temp table a5 on commit preserve rows as
+(select 
+t2.*,
+sum(a.Shipped_orders) as 'Shipped_orders',
+sum(a.DEL_14_days) as 'DEL_14_days'
+from
+(
+select distinct
+Payment_mode,
+shipping_mode,
+state,
+tier,
+courier_group1,
+min(rank) as 'Rank'
+from
+(select distinct
+Payment_mode,
+shipping_mode,
+state,
+tier,
+courier_group1,
+rank,
+--min(rank) as 'rank',
+sum(Shipped_orders) as 'Shipped_orders',
+sum(DEL_14_days) as 'DEL_14_days'
+
+from analytics_logistics.ay_rto12_bucket1_16_31 a
+GROUP BY 1,2,3,4,5,6
+having(sum(Shipped_orders))>=30
+) t1
+
+group by 1,2,3,4,5
+) t2
+
+JOIN analytics_logistics.ay_rto12_bucket1_16_31 a ON a.state = t2.state and a.tier = t2.tier and a.courier_group1 = t2.courier_group1 and a.rank = t2.rank
+and a.shipping_mode = t2.shipping_mode and a.Payment_mode = t2.Payment_mode
+
+group by 1,2,3,4,5,6
+)
+;
+
+---------------------TIER_O2A-------------
+
+
+drop table if exists a6;
+create local temp table a6 on commit preserve rows as
+(select 
+t2.*,
+sum(a.Shipped_orders) as 'Shipped_orders',
+sum(a.DEL_14_days) as 'DEL_14_days'
+from
+(
+select distinct
+Payment_mode,
+shipping_mode,
+--state,
+tier,
+o2a_bucket,
+courier_group1,
+min(rank) as 'Rank'
+from
+(select distinct
+Payment_mode,
+shipping_mode,
+--state,
+tier,
+o2a_bucket,
+courier_group1,
+rank,
+--min(rank) as 'rank',
+sum(Shipped_orders) as 'Shipped_orders',
+sum(DEL_14_days) as 'DEL_14_days'
+
+from analytics_logistics.ay_rto12_bucket1_16_31 a
+GROUP BY 1,2,3,4,5,6
+having(sum(Shipped_orders))>=30
+) t1
+
+group by 1,2,3,4,5
+) t2
+
+JOIN analytics_logistics.ay_rto12_bucket1_16_31 a ON  a.tier = t2.tier and a.courier_group1 = t2.courier_group1 and a.rank = t2.rank
+and a.shipping_mode = t2.shipping_mode and a.Payment_mode = t2.Payment_mode and a.o2a_bucket= t2.o2a_bucket
+
+group by 1,2,3,4,5,6
+)
+;
+
+---------------------------------TIER--------------------------------------------
+
+
+
+drop table if exists a7;
+create local temp table a7 on commit preserve rows as
+(select 
+t2.*,
+sum(a.Shipped_orders) as 'Shipped_orders',
+sum(a.DEL_14_days) as 'DEL_14_days'
+from
+(
+select distinct
+Payment_mode,
+shipping_mode,
+--state,
+tier,
+--o2a_bucket,
+courier_group1,
+min(rank) as 'Rank'
+from
+(select distinct
+Payment_mode,
+shipping_mode,
+--state,
+tier,
+--o2a_bucket,
+courier_group1,
+rank,
+--min(rank) as 'rank',
+sum(Shipped_orders) as 'Shipped_orders',
+sum(DEL_14_days) as 'DEL_14_days'
+
+from analytics_logistics.ay_rto12_bucket1_16_31 a
+GROUP BY 1,2,3,4,5
+having(sum(Shipped_orders))>=30
+) t1
+
+group by 1,2,3,4
+) t2
+
+JOIN analytics_logistics.ay_rto12_bucket1_16_31 a ON  a.tier = t2.tier and a.courier_group1 = t2.courier_group1 and a.rank = t2.rank
+and a.shipping_mode = t2.shipping_mode and a.Payment_mode = t2.Payment_mode 
+
+group by 1,2,3,4,5
+)
+;
+
+
+drop table if exists s;
+create local temp table s on commit preserve rows as
+(
+select DISTINCT
+suborder_code,
+serv_courier_group,
+shipping_mode,
+FLOOR(final) as 'O2A'
+
+FROM analytics_logistics.ayu_sample_o2a_data2_16_31
+);
+
+
+--SELECT * from analytics_logistics.ayu_sample_o2a_data2 order by 1 limit 100;
+
+
+
+
+drop table if exists ay;
+create local temp table ay on commit preserve rows as
+(
+select t.*,
+
+/*case           when o2a_avg between 0 and 5 then '0_to_5'
+               when o2a_avg between 6 and 7 then '6_to_7'
+               when o2a_avg between 8 and 10 then '8_to_10'
+               when o2a_avg between 11 and 12 then '11_to_12'
+               when o2a_avg >12 then '>12'
+               when o2a_avg is null and a.shipping_mode = 'Air' then '6_to_7'
+               when o2a_avg is null and a.shipping_mode = 'Surface' then '8_to_10'
+               end as 'O2A_Bucket'*/
+               
+case           when a.O2A between 0 and 3 then '0_to_3'
+               when a.O2A between 4 and 6 then '4_to_6'
+               when a.O2A between 7 and 9 then '7_to_9'
+               when a.O2A between 10 and 12 then '10_to_12'
+               
+ --              when a.O2A between 11 and 12 then '11_to_12'
+               when a.O2A >12 then '>12'
+               when a.O2A is null and a.shipping_mode = 'Air' then '4_to_6'
+               when a.O2A is null and a.shipping_mode = 'Surface' then '7_to_9'
+               end as 'O2A_Bucket'               
+
+
+from analytics_logistics.final_rate_card1_16_31 t
+join s a on a.serv_courier_group = t.serv_courier_group and a.shipping_mode = t.shipping_mode and a.suborder_code = t.suborder_code
+
+)
+;
+
+
+
+
+
+
+
+drop table if exists t;
+create local temp table t on commit preserve rows as
+(
+
+select distinct
+n.*,
+n.shippeda/n.rank1 as 'shipped1',
+n.shippedb/n.rank2 as 'shipped2',
+n.shippedc/n.rank3 as 'shipped3',
+n.shippedd/n.rank4 as 'shipped4',
+n.shippede/n.rank5 as 'shipped5',
+n.shippedf/n.rank6 as 'shipped6',
+n.shippedg/n.rank7 as 'shipped7',
+n.shippedh/n.rank8 as 'shipped8'
+
+from
+(select t.*,
+a.shipped_orders as 'shippeda',
+(a.shipped_orders-a.DEL_14_days)/a.shipped_orders as 'RTO1',
+case when a.rank =1 then 15 
+     when a.rank =2 then 30
+     when a.rank =3 then 45
+     when a.rank =4 then 60
+     when a.rank =5 then 75
+     when a.rank =6 then 90
+end as 'rank1' ,
+
+
+a1.shipped_orders as 'shippedb',
+(a1.shipped_orders-a1.DEL_14_days)/a1.shipped_orders as 'RTO2',
+case when a1.rank =1 then 15 
+     when a1.rank =2 then 30
+     when a1.rank =3 then 45
+     when a1.rank =4 then 60
+     when a1.rank =5 then 75
+     when a1.rank =6 then 90
+end as 'rank2' ,
+
+a2.shipped_orders as 'shippedc',
+(a2.shipped_orders-a2.DEL_14_days)/a2.shipped_orders as 'RTO3',
+case when a2.rank =1 then 15 
+     when a2.rank =2 then 30
+     when a2.rank =3 then 45
+     when a2.rank =4 then 60
+     when a2.rank =5 then 75
+     when a2.rank =6 then 90
+end as 'rank3',
+a3.shipped_orders as 'shippedd',
+(a3.shipped_orders-a3.DEL_14_days)/a3.shipped_orders as 'RTO4',
+case when a3.rank =1 then 15 
+     when a3.rank =2 then 30
+     when a3.rank =3 then 45
+     when a3.rank =4 then 60
+     when a3.rank =5 then 75
+     when a3.rank =6 then 90
+end as 'rank4',
+
+a4.shipped_orders as 'shippede',
+(a4.shipped_orders-a4.DEL_14_days)/a4.shipped_orders as 'RTO5',
+case when a4.rank =1 then 15 
+     when a4.rank =2 then 30
+     when a4.rank =3 then 45
+     when a4.rank =4 then 60
+     when a4.rank =5 then 75
+     when a4.rank =6 then 90
+end as 'rank5',
+
+a5.shipped_orders as 'shippedf',
+(a5.shipped_orders-a5.DEL_14_days)/a5.shipped_orders as 'RTO6',
+case when a5.rank =1 then 15 
+     when a5.rank =2 then 30
+     when a5.rank =3 then 45
+     when a5.rank =4 then 60
+     when a5.rank =5 then 75
+     when a5.rank =6 then 90
+end as 'rank6',
+
+a6.shipped_orders as 'shippedg',
+(a6.shipped_orders-a6.DEL_14_days)/a6.shipped_orders as 'RTO7',
+case when a6.rank =1 then 15 
+     when a6.rank =2 then 30
+     when a6.rank =3 then 45
+     when a6.rank =4 then 60
+     when a6.rank =5 then 75
+     when a6.rank =6 then 90
+end as 'rank7',
+
+a7.shipped_orders as 'shippedh',
+(a7.shipped_orders-a7.DEL_14_days)/a7.shipped_orders as 'RTO8',
+case when a7.rank =1 then 15 
+     when a7.rank =2 then 30
+     when a7.rank =3 then 45
+     when a7.rank =4 then 60
+     when a7.rank =5 then 75
+     when a7.rank =6 then 90
+end as 'rank8'
+
+from ay t
+--from analytics_logistics.final_rate_card1 t
+left join a on a.pincode = t.dest_pincode and a.o2a_bucket = t.o2a_bucket and a.courier_group1 = t.serv_courier_group and a.Payment_mode = t.Payment_mode and a.shipping_mode = t.shipping_mode
+left join a1 on a1.pincode = t.dest_pincode and a1.courier_group1 = t.serv_courier_group and a1.Payment_mode = t.Payment_mode and a1.shipping_mode = t.shipping_mode
+left join a2 on a2.city = t.dest_city and a2.o2a_bucket = t.o2a_bucket and a2.courier_group1 = t.serv_courier_group and a2.Payment_mode = t.Payment_mode and a2.shipping_mode = t.shipping_mode
+left join a3 on a3.city = t.dest_city and a3.courier_group1 = t.serv_courier_group and a3.Payment_mode = t.Payment_mode and a3.shipping_mode = t.shipping_mode
+
+left join a4 on a4.state = t.dest_state and a4.tier = t.dest_tier and a4.o2a_bucket = t.o2a_bucket and a4.courier_group1 = t.serv_courier_group and a4.Payment_mode = t.Payment_mode and a4.shipping_mode = t.shipping_mode
+left join a5 on a5.state = t.dest_state and a5.tier = t.dest_tier  and a5.courier_group1 = t.serv_courier_group and a5.Payment_mode = t.Payment_mode and a5.shipping_mode = t.shipping_mode
+
+left join a6 on  a6.tier = t.dest_tier and a6.o2a_bucket = t.o2a_bucket and a6.courier_group1 = t.serv_courier_group and a6.Payment_mode = t.Payment_mode and a6.shipping_mode = t.shipping_mode
+left join a7 on  a7.tier = t.dest_tier  and a7.courier_group1 = t.serv_courier_group and a7.Payment_mode = t.Payment_mode and a7.shipping_mode = t.shipping_mode
+)n
+
+);
+
+drop table analytics_logistics.ayu1_sample_rto_data_bucket1_16_31;
+create  table analytics_logistics.ayu1_sample_rto_data_bucket1_16_31  as
+(
+select 
+t.*,
+case when shipped1 is not null then 1
+     when shipped2 is not null then 2
+     when shipped3 is not null then 3
+     when shipped4 is not null then 4
+     when shipped5 is not null then 5
+     when shipped6 is not null then 6
+     when shipped7 is not null then 7
+     when shipped8 is not null then 8 else null end as 'Level'
+
+    
+from t
+);
+
+
+
+--select * from  analytics_logistics.ayu_sample_rto_data order by 1 limit 100;
+
+
+drop table if exists tn;
+create local temp table tn on commit preserve rows as
+(select 
+suborder_code,
+min(level) as 'level'
+FROM analytics_logistics.ayu1_sample_rto_data_bucket1_16_31
+group by 1
+) 
+;
+
+drop table analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31;
+create table analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31 as
+(
+select 
+t.*,
+tn.level as 'final_level',
+null::float as 'L1',
+null::float as 'L2',
+null::float as 'L3',
+null::float as 'L4',
+null::float as 'L5',
+null::float as 'L6',
+null::float as 'L7',
+null::float as 'L8'
+
+
+FROM analytics_logistics.ayu1_sample_rto_data_bucket1_16_31 t
+left join tn on tn.suborder_code = t.suborder_code
+)
+;
+
+
+--select * from analytics_logistics.ayu_sample_rto_data1 order by 1 limit 100;
+
+
+update analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31 a
+set L1 = ts.value,
+L2 = ts.value2,
+L3 = ts.value3,
+L4 = ts.value4,
+L5 = ts.value5,
+L6 = ts.value6,
+L7 = ts.value7,
+L8 = ts.value8
+
+from (
+select
+suborder_code,
+sum(shipped1*rto1)/sum(shipped1) as 'value',
+sum(shipped1*rto2)/sum(shipped1) as 'value2',
+sum(shipped1*rto3)/sum(shipped1) as 'value3',
+sum(shipped1*rto4)/sum(shipped1) as 'value4',
+sum(shipped1*rto5)/sum(shipped1) as 'value5',
+sum(shipped1*rto6)/sum(shipped1) as 'value6',
+sum(shipped1*rto7)/sum(shipped1) as 'value7',
+sum(shipped1*rto8)/sum(shipped1) as 'value8'
+
+from analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31
+where  Level = final_level and level =1
+group by 1
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(shipped2*rto2)/sum(shipped2) as 'value2',
+sum(shipped2*rto3)/sum(shipped2) as 'value3',
+sum(shipped2*rto4)/sum(shipped2) as 'value4',
+sum(shipped2*rto5)/sum(shipped2) as 'value5',
+sum(shipped2*rto6)/sum(shipped2) as 'value6',
+sum(shipped2*rto7)/sum(shipped2) as 'value7',
+sum(shipped2*rto8)/sum(shipped2) as 'value8'
+
+from analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31
+where  Level = final_level and level =2
+group by 1
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(shipped3*rto3)/sum(shipped3) as 'value3',
+sum(shipped3*rto4)/sum(shipped3) as 'value4',
+sum(shipped3*rto5)/sum(shipped3) as 'value5',
+sum(shipped3*rto6)/sum(shipped3) as 'value6',
+sum(shipped3*rto7)/sum(shipped3) as 'value7',
+sum(shipped3*rto8)/sum(shipped3) as 'value8'
+
+from analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31
+where  Level = final_level and level =3
+group by 1
+
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(null::float) as 'value3',
+sum(shipped4*rto4)/sum(shipped4) as 'value4',
+sum(shipped4*rto5)/sum(shipped4) as 'value5',
+sum(shipped4*rto6)/sum(shipped4) as 'value6',
+sum(shipped4*rto7)/sum(shipped4) as 'value7',
+sum(shipped4*rto8)/sum(shipped4) as 'value8'
+
+from analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31
+where  Level = final_level and level =4
+group by 1
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(null::float) as 'value3',
+sum(null::float) as 'value4',
+sum(shipped5*rto5)/sum(shipped5) as 'value5',
+sum(shipped5*rto6)/sum(shipped5) as 'value6',
+sum(shipped5*rto7)/sum(shipped5) as 'value7',
+sum(shipped5*rto8)/sum(shipped5) as 'value8'
+
+from analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31
+where  Level = final_level and level =5
+group by 1
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(null::float) as 'value3',
+sum(null::float) as 'value4',
+sum(null::float) as 'value5',
+sum(shipped6*rto6)/sum(shipped6) as 'value6',
+sum(shipped6*rto7)/sum(shipped6) as 'value7',
+sum(shipped6*rto8)/sum(shipped6) as 'value8'
+
+from analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31
+where  Level = final_level and level =6
+group by 1
+UNION
+
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(null::float) as 'value3',
+sum(null::float) as 'value4',
+sum(null::float) as 'value5',
+sum(null::float) as 'value6',
+sum(shipped7*rto7)/sum(shipped7) as 'value7',
+sum(shipped7*rto8)/sum(shipped7) as 'value8'
+
+from analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31
+where  Level = final_level and level =7
+group by 1
+UNION
+select
+suborder_code,
+sum(null::float) as 'value',
+sum(null::float) as 'value2',
+sum(null::float) as 'value3',
+sum(null::float) as 'value4',
+sum(null::float) as 'value5',
+sum(null::float) as 'value6',
+sum(null::float) as 'value7',
+sum(shipped8*rto8)/sum(shipped8) as 'value8'
+
+from analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31
+where  Level = final_level and level =8
+group by 1
+) ts
+where ts.suborder_code = a.suborder_code
+;
+
+
+drop table analytics_logistics.ayu1_sample_rto_data2_bucket1_16_31;
+create table analytics_logistics.ayu1_sample_rto_data2_bucket1_16_31 as
+(
+SELECT 
+a.*,
+CAse when final_level=1 and level = 1 then rto1
+     when final_level=1 and level = 2 then Rto2*L1/L2
+     when final_level=1 and level = 3 then Rto3*L1/L3
+     when final_level=1 and level = 4 then Rto4*L1/L4
+     when final_level=1 and level = 5 then Rto5*L1/L5
+     when final_level=1 and level = 6 then Rto6*L1/L6
+     when final_level=1 and level = 7 then Rto7*L1/L7
+     when final_level=1 and level = 8 then Rto8*L1/L8
+     
+     when final_level=2 and level = 2 then Rto2
+     when final_level=2 and level = 3 then Rto3*l2/l3
+     when final_level=2 and level = 4 then Rto4*l2/l4
+     when final_level=2 and level = 5 then Rto5*l2/l5
+     when final_level=2 and level = 6 then Rto6*l2/l6
+     when final_level=2 and level = 7 then Rto7*l2/l7
+     when final_level=2 and level = 8 then Rto8*l2/l8
+     
+     when final_level=3 and level = 3 then Rto3
+     when final_level=3 and level = 4 then Rto4*l3/l4
+     when final_level=3 and level = 5 then Rto5*l3/l5
+     when final_level=3 and level = 6 then Rto6*l3/l6
+     when final_level=3 and level = 7 then Rto7*l3/l7
+     when final_level=3 and level = 8 then Rto8*l3/l8
+     
+     when final_level=4 and level = 4 then Rto4
+     when final_level=4 and level = 5 then Rto5*l4/l5
+     when final_level=4 and level = 6 then Rto6*l4/l6
+     when final_level=4 and level = 7 then Rto7*l4/l7
+     when final_level=4 and level = 8 then Rto8*l4/l8
+     
+     when final_level=5 and level = 5 then Rto5
+     when final_level=5 and level = 6 then Rto6*l5/l6
+     when final_level=5 and level = 7 then Rto7*l5/l7
+     when final_level=5 and level = 8 then Rto8*l5/l8
+
+     when final_level=6 and level = 6 then Rto6
+     when final_level=6 and level = 7 then Rto7*l6/l7
+     when final_level=6 and level = 8 then Rto8*l6/l8
+
+     when final_level=7 and level = 7 then Rto7
+     when final_level=7 and level = 8 then Rto8*l7/l8
+
+     when final_level=8 and level = 8 then Rto8 end as 'final'
+
+from analytics_logistics.ayu1_sample_rto_data1_bucket1_16_31 a
+order by 1
+)
+;
+
+
+
+update analytics_logistics.ayu1_sample_rto_data2_bucket1_16_31
+set final = 0.0::float
+where final::varchar = 'NaN'
+;
+
+update analytics_logistics.ayu1_sample_rto_data2_bucket1_16_31
+set final = ifnull(ifnull(ifnull(ifnull(ifnull(ifnull(ifnull(rto1,rto2),rto3),rto4),rto5),rto6),rto7),rto8)
+where final = 'Infinity'
+;
+
+
+
+update analytics_logistics.ayu1_sample_rto_data2_bucket1_16_31
+set final = 0.36274 ::float ---0.037901::float
+where final is null
+--where level is null or level
+and Payment_mode = 'COD'
+;
+
+
+update analytics_logistics.ayu1_sample_rto_data2_bucket1_16_31
+set final = 0.037901::float
+where final is null
+--where level is null or level
+and Payment_mode = 'STD'
+;
+
+
+
+
+
+
+
+
+
+
+DROP TABLE if exists n;
+CREATE LOCAL TEMP TABLE n on commit preserve rows as
+(
+select 
+t.*,
+fwd_cost_adj*ps.billed_ratio as 'final_fwd_cost',
+rto_cost_adj*ps1.billed_ratio as 'final_rto_cost'
+
+from
+(SELECT distinct
+a.*,
+
+/*margin,
+closing_fee,
+Logistic_fee,
+fulfillment_charges,*/
+nms.collection_charges,
+nms.shipping_charges,
+nms.PCB,
+RTO_Logistic_charge,
+
+
+case when courier_group1 = 'VULCAN' THEN fwdCostNew2*0.94
+     when courier_group1 = 'XPRESSBESS' THEN fwdCostNew2*0.95
+     when courier_group1 = 'BLUEDART' THEN fwdCostNew2*0.93 ELSE fwdCostNew2 END AS 'fwd_cost_adj',
+     
+case when courier_group1 = 'XPRESSBESS' THEN rto_cost1*0.95
+     when courier_group1 = 'BLUEDART' THEN rto_cost1*0.93 ELSE rto_cost1 END AS 'rto_cost_adj',
+     
+case when courier_group1 = 'XPRESSBESS' THEN ifnull(CodCostNew2,0)*0.95
+     when courier_group1 = 'BLUEDART' THEN ifnull(CodCostNew2,0)*0.93 ELSE ifnull(CodCostNew2,0) END AS 'cod_cost_adj'
+     
+     
+from analytics_logistics.ayu1_sample_rto_data2_bucket1_16_31 a
+left join analytics_logistics.nmpu_suborders nms on nms.suborder_code = a.suborder_code
+)t
+left join analytics_logistics.ns_post_debits_billed_ratio ps on upper(ps.courier_code) = upper(t.Serviceable_courier) and ps.Leg = 'FORWARD' and ps.month=2 and ps.year=2019
+left join analytics_logistics.ns_post_debits_billed_ratio ps1 on upper(ps1.courier_code) = upper(t.Serviceable_courier) and ps1.Leg = 'RTO' and ps1.month=2 and ps1.year=2019
+
+)
+;
+
+drop table if exists n1;
+create local temp table n1 on commit preserve rows as
+(
+select distinct t.*,
+GM_SCA-FFC_SCA as 'NM_SCA'
+
+from
+(select distinct n.*,
+case when datediff('dd',to_date(fso.subo_date_created::varchar,'YYYYMMDD'),to_date(fsp.sph_date_delivered::varchar,'YYYYMMDD'))<=14 then 0 else 1 end as 'IS_Actual_RTO',
+
+((Margin+collection_charges+Logistic_fee+n.closing_fee+shipping_charges-PCB)*(1-final))+(RTO_Logistic_charge*final) as 'GM_SCA',
+final_fwd_cost+(final_rto_cost*final)+(cod_cost_adj*(1-final)) as 'FFC_SCA'
+
+from n
+left join dwh.f_suborders_oms fso on fso.suborder_code = n.suborder_code
+left join dwh.f_shipping_package fsp on fso.soi_shipping_package_id=fsp.sp_shipping_package_id
+
+
+) t
+)
+;
+
+
+
+
+drop table analytics_logistics.sca12_rto1_bucket1_16_31;
+create table analytics_logistics.sca12_rto1_bucket1_16_31  as
+(
+select j.*
+
+from
+(
+select distinct
+n.dest_pincode,
+n.suborder_code,
+n.shipping_mode,
+n.payment_mode,
+--s.O2A as 'Servicable_O2A',
+n.O2A_Bucket,
+--s1.O2A as 'Actual_O2A',
+t.O2A_Bucket as 'Actual_O2A_Bucket',
+
+n.proposed_slab,
+n.courier_code as 'current_courier',
+n.courier_group as 'current_courier_group',
+n.Serviceable_courier,
+n.courier_group1 as 'serv_courier_group',
+
+case when n.O2A between 0 and 3 then '0_to_3'
+     when n.O2A between 4 and 6 then '4_to_6'
+     when n.O2A between 7 and 9 then '7_to_9'
+     when n.O2A between 10 and 12 then '10_to_12'
+     when n.O2A >12 then '>12'
+     end as 'O2A_current_bucket',
+n.O2A as 'Current_O2A',
+
+
+
+t.IS_Actual_RTO,
+((t.Margin+t.collection_charges+t.Logistic_fee+t.closing_fee+t.shipping_charges-t.PCB)*(1-t.IS_Actual_RTO))+(t.RTO_Logistic_charge*t.IS_Actual_RTO) as 'GM_Actual_RTO',
+t.final_fwd_cost+(t.final_rto_cost*t.IS_Actual_RTO)+(t.cod_cost_adj*(1-t.IS_Actual_RTO)) as 'FFC_Actual_rto',
+
+(((t.Margin+t.collection_charges+t.Logistic_fee+t.closing_fee+t.shipping_charges-t.PCB)*(1-t.IS_Actual_RTO))+(t.RTO_Logistic_charge*t.IS_Actual_RTO))-
+(t.final_fwd_cost+(t.final_rto_cost*t.IS_Actual_RTO)+(t.cod_cost_adj*(1-t.IS_Actual_RTO))) as 'NM_Actual_rto',
+
+t.final as 'rto_predicted',
+((t.Margin+t.collection_charges+t.Logistic_fee+t.closing_fee+t.shipping_charges-t.PCB)*(1-t.final))+(t.RTO_Logistic_charge*t.final) as 'GM_predicted_RTO',
+t.final_fwd_cost+(t.final_rto_cost*t.final)+(t.cod_cost_adj*(1-t.final)) as 'FFC_predicted_rto',
+
+(((t.Margin+t.collection_charges+t.Logistic_fee+t.closing_fee+t.shipping_charges-t.PCB)*(1-t.final))+(t.RTO_Logistic_charge*t.final))-
+(t.final_fwd_cost+(t.final_rto_cost*t.final)+(t.cod_cost_adj*(1-t.final))) as 'NM_predicted_rto',
+
+
+n.final as 'rto_servicable_courier',
+
+((n.Margin+n.collection_charges+n.Logistic_fee+n.closing_fee+n.shipping_charges-n.PCB)*(1-n.final))+(n.RTO_Logistic_charge*n.final) as 'GM_Serviceable_RTO',
+n.final_fwd_cost+(n.final_rto_cost*n.final)+(n.cod_cost_adj*(1-n.final)) as 'FFC_serviceable_rto',
+
+(((n.Margin+n.collection_charges+n.Logistic_fee+n.closing_fee+n.shipping_charges-n.PCB)*(1-n.final))+(n.RTO_Logistic_charge*n.final))-
+(n.final_fwd_cost+(n.final_rto_cost*n.final)+(n.cod_cost_adj*(1-n.final))) as 'NM_Servicable_RTO',
+
+row_number() over(partition by n.suborder_code order by (((n.Margin+n.collection_charges+n.Logistic_fee+n.closing_fee+n.shipping_charges-n.PCB)*(1-n.final))+(n.RTO_Logistic_charge*n.final))-
+(n.final_fwd_cost+(n.final_rto_cost*n.final)+(n.cod_cost_adj*(1-n.final))) desc,(n.final_fwd_cost+(n.final_rto_cost*n.final)+(n.cod_cost_adj*(1-n.final))),n.final) as 'Rank'
+
+FROM n1 n
+left join n1 t on t.suborder_code = n.suborder_code and n.courier_code = t.Serviceable_courier
+
+--left join s on s.suborder_code = n.suborder_code and s.serv_courier_group = n.serv_courier_group and n.shipping_mode = s.shipping_mode
+--left join s s1 on s1.suborder_code = t.suborder_code and s1.serv_courier_group = t.serv_courier_group and t.shipping_mode = s1.shipping_mode
+
+
+)j
+where j.Rank = 1
+)
+;
+
+
+grant all on analytics_logistics.sca12_rto1_bucket1_16_31 to public;
+
+select count(*) from analytics_logistics.sca12_rto1_bucket1_16_31;
+
+
+
+
+select * from analytics_logistics.courier_group
+
+
+----------------------------------
+
+
+rank() over (partition by scch.case_id order by scch.last_modified_date asc) as rank 
+FIRST_VALUE(ItemSkuCode) OVER(PARTITION BY ItemSkuCode, Facility ORDER BY aud_create_ts desc, aud_update_ts desc) as 'ItemSkuCode'
+
+
